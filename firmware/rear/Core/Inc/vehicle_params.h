@@ -4,16 +4,22 @@
 /* ── 차량 물리 파라미터 (실측 후 수정) ───────────────────────── */
 #define WHEELBASE           1.55f    /* 휠베이스 [m] */
 #define TRACK_WIDTH         1.08f    /* 트랙폭 [m] */
-#define TIRE_RADIUS         0.2286f  /* 타이어 반경 [m] */
-#define GEAR_RATIO_DEFAULT  3.8f   /* 체인 감속비 */
+/* 2026-09-20 사용자 확인: 타이어 포함 지름 45cm, 감속비 4:1.
+ *   v[m/s] = motor_rpm ÷ GEAR_RATIO ÷ 60 × 2π × TIRE_RADIUS
+ *   1000rpm→21.21km/h, 2000rpm→42.41km/h, 3000rpm→63.62km/h.
+ * ★타이어 반경은 무부하 반경이 아니라 **하중 반경**을 써야 한다. 드라이버가
+ *  탄 상태에서 허브 중심~지면 높이를 재거나, 한 바퀴 굴린 거리 ÷ 2π로 확인할 것.
+ *  여기서 틀리면 그 오차가 desired_yaw_rate(∝v)와 delta_power_limit(∝v)에
+ *  그대로 전파된다. */
+#define TIRE_RADIUS         0.225f   /* 2026-09-20 사용자 확인: 타이어 포함 전체 지름 45cm */
+#define GEAR_RATIO_DEFAULT  4.0f     /* 체인 감속비 — 스프로킷 잇수로 확인할 것 */
 
 /* ── 출력 예산 (kW 도메인) ── */
 #define MOTOR_MAX_KW        7.0f     /* 모터/컨트롤러 풀스케일 캡 (★컨트롤러 재설정 전제)
                                       * 이 값 자체는 "한쪽이 몰아 받을 수 있는 상한"일 뿐이고
                                       * 합계는 P_SUM_MAX_KW가 잡는다. 7kW는 대부분의 모터에서
                                       * 연속정격이 아니라 피크값이므로 열관리 확인 필요. */
-#define P_SUM_MAX_KW        9.5f     /* 양 모터 합 상한 — 불변 (10kW 대비 5% 마진)
-                                      * ★첫 주행(셰이크다운)에는 5~6kW로 낮춰서 시작할 것 */
+#define P_SUM_MAX_KW        10.0f    /* 2026-09-20 사용자 요청: 양 모터 출력 요구 합계 상한 10kW */
 #define P_OFF_EPS_KW        0.05f
 
 /* ── 좌우 차동(ΔP) 한계 ────────────────────────────────────────────
@@ -26,9 +32,24 @@
  *
  * 첫 주행일에는 DELTA_FORCE_MAX_N=200, DELTA_POWER_MAX_KW=1.5 로 시작해서
  * 거동 확인하며 올릴 것. */
-#define DELTA_POWER_MAX_KW    3.0f    /* 고속 구간 ΔP 천장 [kW] (기존 5.0 → 3.0) */
-#define DELTA_FORCE_MAX_N     400.0f  /* 좌우 구동력 차 상한 [N] — 저속 보호의 핵심 */
-#define DELTA_POWER_SLEW_KW_S 40.0f   /* ΔP 변화율 제한 [kW/s]. TV↔ED 전환 계단 제거 +
+/* ★2026-09 실주행 피드백("개입이 약하고 늦다") 반영해 셋 다 상향.
+ *  세 값은 같이 움직여야 한다 — 천장만 올리면 최대 개입 도달이 오히려 느려진다:
+ *      최대 도달시간 = DELTA_POWER_MAX_KW / DELTA_POWER_SLEW_KW_S
+ *      3.0/40 = 75ms  →  5.0/40 = 125ms(악화)  →  5.0/80 = 63ms(개선)
+ *  크로스오버 = MAX_KW·1000/FORCE_N = 8.3 m/s. 그 위로는 kW 상한이 잡는다.
+ * ★★열: 풀스로틀 최대 개입이면 바깥 모터가 MOTOR_MAX_KW(7kW)에 붙는다.
+ *  모터 정격 5000W에 공랭이므로, 컨트롤러 TempSensor(KTY83/122)를 반드시 설정할 것. */
+#define DELTA_POWER_MAX_KW    4.5f    /* 고속 구간 ΔP 천장 [kW] (3.0 → 5.0) */
+#define DELTA_FORCE_MAX_N     600.0f  /* 좌우 구동력 차 상한 [N] — 저속 보호의 핵심 */
+/* ★ΔP를 운전자 요구 전력의 이 비율 이내로 묶는다. 안쪽 바퀴가 (1−FRAC)/2
+ * 만큼은 항상 살아있게 하는 장치다.
+ *     0.7 → 최대 개입에서 15:85 분배 (안쪽이 요구량의 15%를 유지)
+ *     0.6 → 20:80  (더 보수적, 출력 체감 우선)
+ *     1.0 → 안쪽 0까지 허용 (예전 동작 — 한쪽 구동이 되어 출력이 죽는다)
+ * ★"TV 켜면 출력이 낮다"는 피드백이 나오면 이 값을 낮출 것. */
+#define TV_DELTA_DEMAND_FRAC  0.7f
+
+#define DELTA_POWER_SLEW_KW_S 80.0f   /* ΔP 변화율 제한 [kW/s]. TV↔ED 전환 계단 제거 +
                                        * 센서 노이즈가 출력으로 새는 걸 막는다.
                                        * 100Hz에서 틱당 0.4kW → 3kW 스윙에 75ms */
 
@@ -52,19 +73,19 @@
 #define CTRL_FULL_KW        7.0f     /* 그 전압에서의 출력[kW] = 컨트롤러 설정과 반드시 일치 */
 #define V_PER_KW            ((V_CTRL_FULL - V_CTRL_0KW) / CTRL_FULL_KW)  /* 2.05/7 ≈ 0.293 */
 
-/* ★★ STM32 DAC 출력 버퍼(Output Buffer Enable) 사용 시 실제 출력 가능 범위는
- *    데이터시트상 0.2V ~ (VDDA - 0.2V) = 0.2V ~ 3.1V 다. 레일 투 레일이 아니다.
- *    그래서 예전 설정(풀스케일 3.20V)은 상단이 물리적으로 도달 불가였고 3.1V
- *    위쪽은 비선형이라 최대출력이 6.7kW 근처에서 조용히 잘렸다.
- *    → 3.00V로 낮춰서 해결됨. 이제 전 구간이 버퍼 선형 영역 안에 들어온다:
- *         0kW  → 0.95V → 코드 1179
- *         7kW  → 3.00V → 코드 3723   (3.10V 클램프에 안 걸림 = 7kW 전부 사용 가능)
- *         off  → 0.90V → 코드 1116   (하한 0.2V보다 충분히 위)
- *    아래 클램프는 이제 안전망으로만 남는다. */
-#define V_DAC_MAX_MV        3100
+/* ★외부 MCP4822로 바꾸면서 예전 STM32 내부 DAC의 출력버퍼 한계(0.2V~3.1V)
+ * 제약이 사라졌다. MCP4822는 레일투레일 출력이고 VDD=5V 구동이라 4.095V까지
+ * 선형으로 낸다. 이제 전 구간이 여유롭게 들어온다:
+ *      off  → 0.90V → 코드 900
+ *      0kW  → 0.95V → 코드 950
+ *      7kW  → 3.00V → 코드 3000
+ *
+ * 아래 상한은 하드웨어 한계가 아니라 "안전 천장"이다. 스케일링 버그로 4V가
+ * 컨트롤러 스로틀에 나가는 사고를 막기 위해 정상 최대치 바로 위에서 자른다. */
+#define V_DAC_MAX_MV        (V_CTRL_FULL_MV + 200)   /* 3.20V */
 #define V_DAC_MAX_V         (V_DAC_MAX_MV * 0.001f)
-#if (V_CTRL_FULL_MV > V_DAC_MAX_MV)
-#warning "V_CTRL_FULL > 3.10V: DAC 출력버퍼 한계로 도달 불가. 컨트롤러 풀스케일을 3.00V로 재설정하고 V_CTRL_FULL_MV=3000 으로 바꿀 것 (vehicle_params.h 참고)"
+#if (V_DAC_MAX_MV > 4095)
+#error "V_DAC_MAX_MV가 MCP4822 풀스케일(4.095V)을 초과함"
 #endif
 
 /* ── TPS 파라미터 ────────────────────────────────────────────────────
@@ -76,9 +97,15 @@
  *      이 구간만 0~100%로 매핑. 페달 유격과 끝단 여유를 여기서 흡수한다.
  *
  * ★실측(2026-08-06, 벤치): 페달 idle~풀프레스 전압 0.7V~2.5V
- *   0.7V → 0.7/3.3*4095 ≈ 868, 2.5V → 2.5/3.3*4095 ≈ 3102 */
-#define TPS_ADC_MIN         868      /* 0.7V (idle) */
-#define TPS_ADC_MAX         3102     /* 2.5V (풀프레스) */
+ *   0.7V → 0.7/3.3*4095 ≈ 868, 2.5V → 2.5/3.3*4095 ≈ 3102
+ *
+ * ★★실차 장착 후 재실측(2026-09): idle 880~890, 풀프레스 2790~2820.
+ *   벤치의 3102는 센서를 손으로 끝까지 돌렸을 때 값이고, 차에 달면 페달
+ *   스토퍼가 센서 끝보다 먼저 닿아서 2820에서 멈춘다. 3102를 그대로 두면
+ *   hi=2922라 페달을 끝까지 밟아도 94%까지밖에 안 올라갔다.
+ *   → 실측 상단(2820)을 기준으로 바꾸고 MARGIN을 줄여 100%를 보장한다. */
+#define TPS_ADC_MIN         885      /* ★실차 실측 idle (880~890) */
+#define TPS_ADC_MAX         2820     /* ★실차 실측 풀프레스 (2790~2820) */
 
 /* 단선/단락 진단 마진. 마진 없이 MIN/MAX를 그대로 쓰면 idle에서 ADC가 1LSB만
  * 아래로 튀어도 즉시 STOP이 걸린다(실차에서 확실히 터질 문제).
@@ -101,10 +128,13 @@
  * 보통 3~8%라 이 범위 안이다. 실차에서 발 뗐을 때 tps_pct가 0이 아니면 늘릴 것. */
 #define TPS_DEADBAND_RAW    110
 
-/* ★끝단 여유 — 페달 스토퍼가 센서 끝보다 먼저 닿으면 3102에 영영 도달 못 해서
- * 100% 출력이 안 나온다. 위쪽에서 미리 잘라 "끝까지 밟으면 확실히 100%"를 보장.
- * 180카운트 = 약 8%. 실차에서 끝까지 밟아도 tps_pct가 100이 안 되면 늘릴 것. */
-#define TPS_FULL_MARGIN_RAW 180
+/* ★끝단 여유 — 위쪽에서 미리 잘라 "끝까지 밟으면 확실히 100%"를 보장한다.
+ * ★180 → 80으로 줄였다. TPS_ADC_MAX가 이제 벤치값(3102)이 아니라 실차 실측
+ *   상단(2820)이라, 예전만큼 큰 여유가 필요 없다. 필요한 건 밟을 때마다
+ *   생기는 편차(실측 2790~2820 = 30카운트)를 덮을 만큼이면 된다.
+ *     hi = 2820 − 80 = 2740  →  최악(2790)에도 hi를 넘으므로 100% 보장
+ *   80카운트 = 전체 스트로크(1935)의 약 4%. */
+#define TPS_FULL_MARGIN_RAW 80
 
 /* ★부팅 시 idle 위치 자동 학습 (양산차의 APP idle learn과 같은 개념).
  * 장착 후 유격이 자리를 잡거나 온도로 드리프트하면 idle raw가 벤치값에서
@@ -119,12 +149,34 @@
 #define TPS_IDLE_LEARN_SPREAD  30
 
 /* ── SAS 파라미터 ──────────────────────────────────────────── */
-#define SAS_TO_STEERING_RATIO   -0.2f  /* 조향비 조절인듯 ★실측★ SAS raw→조향각[rad]. 부호 음수인 이유:
+#define SAS_TO_STEERING_RATIO   -0.45f  /* 조향비 조절인듯 ★실측★ SAS raw→조향각[rad]. 부호 음수인 이유:
                                         * 센서는 우회전 시 raw 증가하지만, Ackermann 공식/
                                         * IMU(+좌회전) 관례상 delta는 좌회전이 양수여야 함 */
-#define SAS_CENTER_RAW          8192   /* ★실측★ 직진(0도) 시 raw값 */
+#define SAS_CENTER_RAW          6845   /* 2026-09-20 user straight-ahead: 52 valid samples, mean 6845.10, range 6842..6848 */
 #define SAS_RAW_TO_RAD          (2.0f * 3.14159265f / 16384.0f) /* raw 1LSB당 rad(센서 1회전 기준, 실측 보정) */
-#define MAX_STEERING_ANGLE_RAD  0.52f  /* 약 30도 */
+/* ★2026-09 실측: 풀락에서 안쪽 30°, 바깥쪽 23° (좌선회 기준).
+ * 자전거 모델 등가각은 단순 평균이 아니라 코탄젠트 평균이다 —
+ * 선회 반경이 조향각의 탄젠트에 반비례하기 때문:
+ *     cot δ = (cot 30° + cot 23°)/2 = 2.0440  →  δ = 26.06° = 0.455 rad
+ * 0.46은 거기에 서스펜션 스트로크에 따른 편차만큼만 여유를 준 값이다.
+ * ★이 값은 "센서 고장으로 말도 안 되는 δ가 나오는 것"을 막는 용도라,
+ *  물리적 최대치에 바짝 붙여두는 게 맞다. 너무 크게 잡으면 고장 시
+ *  거대한 목표 요레이트가 만들어진다.
+ * ★참고: 애커먼율 = (cot23−cot30)/(T/L) = 0.624/0.710 = 88%
+ *  → 기계파트 보고서의 "Jeantaud type 90%"와 일치. 기하는 설계대로다. */
+#define MAX_STEERING_ANGLE_RAD  0.46f  /* 등가 26.4도 — ★실측★ 타이어 최대 조향각.
+                                        * 이 값보다 실제 조향각이 크면 그 구간이
+                                        * 통째로 클램프돼서, 많이 꺾을수록 개입이
+                                        * 커져야 할 때 오히려 평평해진다.
+                                        * (30도로 잘려서 "급조향 시 안 느껴진다"는
+                                        *  피드백이 나왔음 — 2026-09 실주행) */
+
+/* ★ESP32 링크가 없거나 끊겼을 때의 TV 차동 강도 (TV_SetStrength에 들어가는 값).
+ *   1.0 = ESP32 없이도 기존대로 100% 개입 (지금 구성)
+ *   0.0 = ESP32 명령이 있어야만 개입 (팀원 원본 설계, 핏에서 강도를 쥘 때)
+ * ★0.0으로 두면 ESP32를 안 달았을 때 TV가 조용히 죽는다. 스위치를 켜도
+ *  아무 일이 안 일어나므로, ESP 링크가 확실히 붙기 전까지는 1.0으로 둘 것. */
+#define TV_STRENGTH_NO_ESP  1.0f
 
 /* ── 제어 파라미터 ─────────────────────────────────────────── */
 #define CONTROL_FREQ_HZ     100
@@ -166,7 +218,29 @@
  * 요레이트, v)를 기록해서 Kus = (v·tanδ/γ_steady - L) / v² 로 역산해 튜닝.
  * 단위 [s^2/m^2](=1/(m/s^2) 아님, v^2 항과 곱해지는 형태). 언더스티어 성향이면
  * 양수, 오버스티어 성향이면 음수. */
-#define UNDERSTEER_GRADIENT 0.0f
+/* ★★ 미실측 — 이게 0으로 남아 있는 게 "코너를 계속 돌면 토크가 붙는다"의
+ * 근본 원인이다. Kus=0이면 목표가 "언더스티어가 전혀 없는 이상적인 차"의
+ * 요레이트가 되는데, 실제 차는 반드시 언더스티어하므로 정상 선회 중에도
+ * 오차가 0으로 안 떨어진다 → 적분이 계속 쌓여 토크가 서서히 붙는다.
+ *
+ * ★로그에서 바로 계산할 수 있다. 일정한 코너를 정상상태로 돌 때(조향·속도가
+ * 안정된 구간) 한 샘플만 집어서:
+ *
+ *     Kus = ( v·tan(δ) / ψ_실측  −  WHEELBASE ) / v²
+ *
+ *   v = vehicle_speed, δ = steering_angle_rad, ψ_실측 = imu_yaw_rate.
+ *   여러 코너에서 뽑아 평균낼 것. FS 차량은 보통 0.002~0.010 범위.
+ *   제대로 넣으면 정상 선회 시 오차가 0으로 수렴해서 적분이 안 쌓인다. */
+/* ★2026-09: 실측 전 임시값 0.005 투입. 0은 "언더스티어가 전혀 없는 차"라는
+ * 물리적으로 불가능한 가정이라, 타당한 추정값이 무조건 낫다.
+ * 오차 방향도 안전하다 — 실제가 더 크면 덜 틀린 것이고, 더 작으면 목표가
+ * 보수적이 되어 개입이 줄 뿐이다.
+ * ★실측으로 대체할 것. 정상 선회(속도·조향 2초 이상 일정, TV OFF) 한 점에서:
+ *     Kus = ( v·tan(δ) / ψ − WHEELBASE ) / v²
+ *   TV 디버그 줄 기준 v=v/100[m/s], δ=str/1000[rad], ψ=yaw/1000[rad/s].
+ *   좌·우 양방향을 평균내면 조향 영점 잔차가 상쇄된다.
+ *   FS 차량 통상 0.003~0.015. 음수가 나오면 조향비나 데이터를 의심할 것. */
+#define UNDERSTEER_GRADIENT 0.005f
 
 /* ── 횡가속도 기반 트랙션 안전장치 ────────────────────────────────
  * 예측 횡가속도(a_lat = v·실제요레이트)와 IMU 실측 횡가속도가 크게 다르면
@@ -175,22 +249,81 @@
  * MISMATCH_MAX 이상이면 TV 개입을 완전히 0으로 줄임. 그 사이는 선형 보간. */
 #define LAT_ACC_MISMATCH_OK   2.0f    /* [m/s^2] */
 #define LAT_ACC_MISMATCH_MAX  6.0f    /* [m/s^2] */
-/* IMU를 뒤집어 달거나 X축을 뒤로 향하게 달면 횡가속 부호가 반대가 된다.
- * 그러면 mismatch가 항상 커져서 TV가 계속 죽는다. 실차에서 좌선회 시
- * lat 로그가 음수로 나오면 이 값을 -1.0f로. */
-#define IMU_LAT_ACC_SIGN      1.0f
+/* IMU/body frame, operator-confirmed on 2026-09-19:
+ * WT901C-TTL +X = vehicle forward, +Y = left, +Z = up (right handed).
+ * R_body_from_sensor = identity. Positive Wz is a left/CCW turn viewed
+ * from above; positive Ay is leftward acceleration. Controller convention:
+ * delta > 0, yaw > 0, dP > 0 (right power > left) all request a left turn.
+ * The old (-Y, -Z) correction assumed an upside-down sensor; that assumption
+ * contradicts the confirmed mounting. Apply this mapping exactly once in
+ * imu_sensor.c before bias/filtering, for PID, traction and telemetry alike.
+ * Wz is body angular velocity (packet 0x52), not Euler heading (0x53).
+ */
+#define IMU_YAW_RATE_SIGN      1.0f
+#define IMU_LAT_ACC_SIGN       1.0f
 
-/* ── PID 게인 (실차 튜닝 필요, 출력 단위 = kW) ────────────────── */
-#define PID_KP              5.0f
-#define PID_KI              2.0f
-#define PID_KD              0.5f
-// 어플 말고 이걸 조절해야 할 듯
+/* ── PID 게인 (실차 튜닝 필요, 출력 단위 = kW) ──────────────────
+ * ★2026-09 실주행 피드백: "개입이 약하고 늦다. 급조향 때는 안 느껴지고
+ *   코너를 계속 돌고 있으면 그제서야 토크가 붙는다."
+ *   → 전형적인 "P 부족 + I 의존" 증상이다. 체감되는 토크를 느린 적분항이
+ *     만들고 있어서, 즉각 반응이 없고 수 초에 걸쳐 쌓이는 느낌이 난다.
+ *   기존 KI=2.0으로 오차 0.1rad/s에서 1kW를 쌓는 데 약 5초가 걸렸다.
+ *
+ *   KP ↑ : 조향 즉시 반응 (체감 응답의 대부분을 여기서 만든다)
+ *   KI ↓ : 느리게 쌓이는 느낌 제거. ★단 UNDERSTEER_GRADIENT가 0으로 남아
+ *          있는 한 정상 선회 중 오차가 0으로 안 떨어져서 적분이 계속 쌓인다 —
+ *          근본 해결은 Kus 실측이다(아래 주석 참고).
+ *   KD ↑ : 급조향(=목표 요레이트 계단 변화)에 즉각 반응. 노이즈에 민감하니
+ *          떨림이 생기면 제일 먼저 되돌릴 것. */
+#define PID_KP              50.0f    /* 10.0 → 18.0 */
+#define PID_KI              1.0f     /*  2.0 →  1.0 */
+#define PID_KD              5.0f     /*  0.5 →  1.5 */
 #define PID_INTEGRAL_MAX    DELTA_POWER_MAX_KW
 #define PID_OUTPUT_MAX      DELTA_POWER_MAX_KW
 
-/* ── DAC ───────────────────────────────────────────────────── */
-#define DAC_RESOLUTION      4095
-#define DAC_VREF            3.3f
+/* ── 독립 워치독 (IWDG) ──────────────────────────────────────────────
+ * ★왜 필요한가: 펌웨어가 멎어도 DAC는 마지막 값을 그대로 유지한다. 그 값이
+ *  높았다면 양쪽 모터가 계속 고출력으로 남는다 — 안전 문제이자, 컨트롤러
+ *  MaxLineCurr를 121A(7kW)로 올린 뒤에는 총 10kW 규정 위반이 된다.
+ *  IWDG가 걸리면 MCU가 리셋되고 DAC는 0으로 떨어진다.
+ *
+ * ★타임아웃 선정: 메인 루프에서 제일 오래 걸리는 건 USART2 디버그 출력이다
+ *  (블로킹, 타임아웃 20ms × 2줄 = 최악 40ms). SD를 안 쓰므로 FatFs의
+ *  f_write/f_sync는 s_open=false라 즉시 리턴해서 블로킹이 없다.
+ *  → SD를 쓰게 되면 카드에 따라 수백 ms 블로킹하므로 이 값을 다시 늘릴 것.
+ *
+ *  LSI는 개체차가 커서(17~47kHz) 실제 타임아웃이 크게 흔들린다:
+ *    타임아웃[s] = RELOAD × PRESCALER / LSI
+ *      공칭(32kHz): 250 × 64 / 32000 = 0.50s
+ *      최악(47kHz): 0.34s   ← 최악 루프 40ms 대비 약 8배 여유
+ *      최선(17kHz): 0.94s
+ *  주행 중 오작동 리셋이 행보다 위험하므로 여유를 충분히 두고 잡았다. */
+#define IWDG_PRESCALER_DIV  IWDG_PRESCALER_64
+#define IWDG_RELOAD_COUNT   250u
+
+/* ── DAC 백엔드 선택 ─────────────────────────────────────────────────
+ * 0 = 외부 MCP4822 (SPI3) ← 정식 구성
+ * 1 = STM32 내부 DAC (PA4/PA5) ← ★임시/진단 전용
+ *
+ * ★내부 DAC은 PA4/PA5가 TTa(3.3V 톨러런트) 핀이라 컨트롤러 신호 환경을 못
+ *  버틴다. 실제로 보드 여러 장의 DAC 채널이 이 경로로 손상됐다. 부품 도착 전
+ *  임시 단일모터 시험이나 "이 보드의 어느 채널이 살아있나" 확인 용도로만 쓰고,
+ *  쓸 때도 PA4/PA5에 직렬 1kΩ을 반드시 넣을 것.
+ *
+ * 두 백엔드는 핀이 겹치지 않아(PA4/PA5 vs PB3/PB4/PB5) 공존 가능하다.
+ * 이 스위치 하나만 바꾸면 되고, 제어 로직은 어느 쪽이든 동일하게 동작한다. */
+#define DAC_USE_INTERNAL    1
+
+#define DAC_RESOLUTION      4095     /* 두 백엔드 모두 12비트 */
+
+/* 1V당 코드 수 — 백엔드에 따라 환산이 다르다.
+ *   MCP4822 : 게인2배 + 내장 2.048V → 풀스케일 4.096V → 1 LSB = 1mV
+ *   내부 DAC: VREF 3.3V 풀스케일 → 1 LSB = 0.806mV */
+#if DAC_USE_INTERNAL
+  #define DAC_CODE_PER_V    (4095.0f / 3.3f)   /* ≈ 1240.9 */
+#else
+  #define DAC_CODE_PER_V    1000.0f
+#endif
 
 /* ── 안전 타임아웃 [ms] ────────────────────────────────────── */
 #define CAN_TIMEOUT_MS      100
@@ -257,5 +390,12 @@
 #define RPM_MAX_PLAUSIBLE   8000.0f
 #define RPM_MIN_PERIOD_US   ((uint32_t)(60000000.0f * RPM_CAL_GAIN / \
                              (RPM_MAX_PLAUSIBLE * (float)RPM_PULSES_PER_REV)))
+
+/* ★16비트 랩어라운드 교차검증 허용오차 [ms].
+ * TIM3는 16비트라 10us/tick에서 655ms를 넘는 주기는 카운터가 한 바퀴 돌아
+ * 짧은 값으로 앨리어싱된다. 캡처 주기와 HAL_GetTick() 경과시간이 이 값보다
+ * 크게 어긋나면 랩어라운드(또는 펄스 누락)로 보고 버린다.
+ * 정상이면 둘이 1~2ms 안에서 일치하므로 5ms면 충분한 여유다. */
+#define RPM_WRAP_TOL_MS     5u
 
 #endif /* VEHICLE_PARAMS_H */

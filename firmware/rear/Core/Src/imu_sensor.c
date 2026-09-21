@@ -4,11 +4,13 @@
 #include "filters.h"
 #include "main.h"
 #include <math.h>
+#include "vehicle_clock.h"
+#include "timing_diag.h"
 
-/* CubeMX: USART3 TX=PC10 / RX=PC11 (board_config.h), IMU_UART_BAUD, 8N1,
- * RX는 DMA1 Stream1 Ch4 — 반드시 Circular 모드 */
-extern UART_HandleTypeDef huart3;
-extern DMA_HandleTypeDef hdma_usart3_rx;
+/* CubeMX: UART4 TX=PA0 / RX=PA1 (board_config.h), IMU_UART_BAUD, 8N1,
+ * RX는 DMA1 Stream2 Ch4 — 반드시 Circular 모드 */
+extern UART_HandleTypeDef huart4;
+extern DMA_HandleTypeDef hdma_uart4_rx;
 
 /* ★256→512로 늘렸다. 메인 루프가 SD f_write+f_sync에서 수십 ms 블로킹될 수
  * 있는데, 그동안 IMU_ProcessData()가 안 돌아서 DMA 링버퍼가 계속 쌓인다.
@@ -23,10 +25,37 @@ extern DMA_HandleTypeDef hdma_usart3_rx;
 
 static uint8_t  s_rx[RX_BUF_SIZE];
 static uint16_t s_read_idx = 0;
+/* IDLE bounds continuous UART bursts. Per-byte estimates remain available
+ * even when the main loop is delayed by SD or USB. IRQ latency and internal
+ * sensor delay are NOT measured by these timestamps. */
+static volatile uint16_t s_idle_write;
+static volatile uint32_t s_byte_rx_us[RX_BUF_SIZE];
+
+void IMU_OnRxIdle(void) {
+    uint32_t event_us=VehicleClock_Us32();
+    uint16_t w=(uint16_t)((RX_BUF_SIZE-__HAL_DMA_GET_COUNTER(&hdma_uart4_rx))%RX_BUF_SIZE);
+    uint16_t count=(uint16_t)((w+RX_BUF_SIZE-s_idle_write)%RX_BUF_SIZE);
+    // IDLE is asserted one 8N1 character time after the final byte.
+    for(uint16_t i=0;i<count;i++) {
+        uint16_t index=(uint16_t)((s_idle_write+i)%RX_BUF_SIZE);
+        s_byte_rx_us[index]=event_us-((uint32_t)(count-i)*10000000u+57600u)/115200u;
+    }
+    __DMB();s_idle_write=w;
+}
 
 static volatile float    s_yaw_rate = 0.0f;   /* rad/s, 원본(바이어스·필터 전) */
 static volatile float    s_lat_acc  = 0.0f;   /* m/s^2, 원본 */
 static volatile uint32_t s_last_ms  = 0;
+static float s_acc_x, s_acc_y, s_acc_z;
+static uint32_t s_acc_last_ms;
+
+float IMU_GetAccelerationX(void) { return s_acc_x; }
+float IMU_GetAccelerationY(void) { return s_acc_y; }
+float IMU_GetAccelerationZ(void) { return s_acc_z; }
+bool IMU_IsTelemetryFresh(void) {
+    return IMU_IsValid() && g_imu_acc_ok != 0u &&
+           HAL_GetTick() - s_acc_last_ms <= IMU_TIMEOUT_MS;
+}
 
 /* 제어 주기(100Hz)에 동기해서 갱신되는 필터 출력 — 제어/로깅은 이 값을 쓴다.
  * ★필터를 파서 안(패킷 도착 시점)이 아니라 IMU_Update()에서 도는 이유:
@@ -60,12 +89,13 @@ static volatile double   s_cal_acc_sum   = 0.0;
 static volatile uint32_t s_cal_acc_count = 0;
 
 /* 디버그용 진단 카운터 — Live Expression으로 확인 가능 */
-static volatile uint32_t s_pkt_ok    = 0;   /* 체크섬 통과 (ACC/GYRO만 여기 도달) */
-static volatile uint32_t s_pkt_bad   = 0;   /* 체크섬 실패 */
-static volatile uint32_t s_resync    = 0;   /* 헤더 불일치로 1바이트씩 스킵한 횟수 */
-static volatile uint32_t s_gyro_ok   = 0;   /* 실제 자이로(0x52) 갱신 횟수 */
-static volatile uint32_t s_acc_ok    = 0;   /* 실제 가속도(0x51) 갱신 횟수 */
-static volatile uint32_t s_dma_restart = 0; /* 워치독이 DMA를 되살린 횟수 */
+volatile uint32_t g_imu_pkt_ok    = 0;   /* 체크섬 통과 (ACC/GYRO만 여기 도달) */
+volatile uint32_t g_imu_pkt_bad   = 0;   /* 체크섬 실패 */
+volatile uint32_t g_imu_resync    = 0;   /* 헤더 불일치로 1바이트씩 스킵한 횟수 */
+volatile uint32_t g_imu_gyro_ok   = 0;   /* 실제 자이로(0x52) 갱신 횟수 */
+volatile uint32_t g_imu_acc_ok    = 0;   /* 실제 가속도(0x51) 갱신 횟수 */
+volatile uint32_t g_imu_dma_restart = 0; /* 워치독이 DMA를 되살린 횟수 */
+volatile uint32_t g_imu_dma_fail    = 0; /* 되살리기 실패(HAL이 BUSY/ERROR 반환) */
 
 static const float DEG2RAD = 3.14159265f / 180.0f;
 static const float G_ACC   = 9.80665f;
@@ -74,18 +104,19 @@ static const float G_ACC   = 9.80665f;
  * ★이전 버전은 reg=0x04(BAUD 레지스터)로 잘못 보내고 있었다. 공식 SDK(REG.h,
  * https://github.com/WITMOTION/WitStandardProtocol_JY901) 확인 결과 정확한
  * 주소는 RRATE=0x03, RSW=0x02, BAUD=0x04 이다. 그동안 RRATE가 실제로는 전혀
- * 바뀌지 않아 공장 기본값(~20Hz)으로 계속 동작했던 것 — 그래서 s_gyro_ok가
+ * 바뀌지 않아 공장 기본값(~20Hz)으로 계속 동작했던 것 — 그래서 g_imu_gyro_ok가
  * 20/sec 근처였다. */
 static void imu_configure(void) {
     uint8_t cmd_rsw[5]  = { 0xFF, 0xAA, 0x02, 0x06, 0x00 };  /* RSW: ACC|GYRO만 (0x02|0x04) */
     uint8_t cmd_rate[5] = { 0xFF, 0xAA, 0x03, 0x09, 0x00 };  /* RRATE: 100Hz */
-    HAL_UART_Transmit(&huart3, cmd_rsw,  sizeof(cmd_rsw),  50);
+    HAL_UART_Transmit(&huart4, cmd_rsw,  sizeof(cmd_rsw),  50);
     HAL_Delay(5);
-    HAL_UART_Transmit(&huart3, cmd_rate, sizeof(cmd_rate), 50);
+    HAL_UART_Transmit(&huart4, cmd_rate, sizeof(cmd_rate), 50);
 }
 
 void IMU_Init(void) {
     s_read_idx = 0;
+    s_idle_write=0;
     Deglitch_Reset(&s_yaw_dg);
     LPF1_Reset(&s_yaw_lpf);
     LPF1_Reset(&s_acc_lpf);
@@ -93,28 +124,33 @@ void IMU_Init(void) {
     s_acc_filt = 0.0f;
     imu_configure();
     HAL_Delay(50);
-    HAL_UART_Receive_DMA(&huart3, s_rx, RX_BUF_SIZE);
+    HAL_UART_Receive_DMA(&huart4, s_rx, RX_BUF_SIZE);
+    __HAL_UART_CLEAR_IDLEFLAG(&huart4);
+    __HAL_UART_ENABLE_IT(&huart4,UART_IT_IDLE);
+    HAL_NVIC_SetPriority(UART4_IRQn,1,0);
+    HAL_NVIC_EnableIRQ(UART4_IRQn);
 }
 
 /* DMA가 다음에 쓸 위치 */
-static uint16_t dma_write_idx(void) {
-    return (uint16_t)(RX_BUF_SIZE - __HAL_DMA_GET_COUNTER(&hdma_usart3_rx));
-}
 
 /* 체크섬 통과 시 true, 실패 시 false — 호출부가 이 값으로 이동폭을 결정한다 */
 static bool parse_packet(const uint8_t *p) {
     uint8_t sum = 0;
     for (int i = 0; i < 10; i++) sum += p[i];
-    if (sum != p[10]) { s_pkt_bad++; return false; }
-    s_pkt_ok++;
+    if (sum != p[10]) { g_imu_pkt_bad++; return false; }
+    g_imu_pkt_ok++;
 
     if (p[1] == WT_GYRO) {
         /* 0x52: 55 52 wxL wxH wyL wyH wzL wzH TL TH SUM → wz = p[6],p[7] */
         int16_t wz = (int16_t)((uint16_t)p[6] | ((uint16_t)p[7] << 8));
         float dps  = (float)wz / 32768.0f * 2000.0f;   /* °/s */
-        s_yaw_rate = dps * DEG2RAD;                     /* rad/s, 원본(bias 미반영) */
+        /* ★부호를 여기(소스)에서 확정한다. 예전에는 IMU_LAT_ACC_SIGN만 있었고
+         * 그것도 torque_vectoring.c의 사용처에서 곱하고 있어서, 로거·부팅 메시지·
+         * Live Expression은 부호가 안 맞은 원본을 보고 있었다. 이제 여기서 한 번만
+         * 곱하면 하위 전부(TV, SD 로그, 디버그 출력)가 같은 부호를 본다. */
+        s_yaw_rate = dps * DEG2RAD * IMU_YAW_RATE_SIGN; /* rad/s, 원본(bias 미반영) */
         s_last_ms  = HAL_GetTick();
-        s_gyro_ok++;
+        g_imu_gyro_ok++;
         if (s_cal_active) {          /* 캘리브레이션 중이면 원본값을 누적 */
             s_cal_sum += (double)s_yaw_rate;
             s_cal_count++;
@@ -127,9 +163,15 @@ static bool parse_packet(const uint8_t *p) {
          * 항상 커져서 TV 개입이 부당하게 깎이고, 급가속/급감속 때는 반대로
          * 엉뚱하게 트랙션 상실로 판정됐다. (자이로 wz=p[6],p[7]은 원래 맞음) */
         int16_t ay = (int16_t)((uint16_t)p[4] | ((uint16_t)p[5] << 8));
+        int16_t ax = (int16_t)((uint16_t)p[2] | ((uint16_t)p[3] << 8));
+        int16_t az = (int16_t)((uint16_t)p[6] | ((uint16_t)p[7] << 8));
+        s_acc_x = (float)ax / 32768.0f * 16.0f * G_ACC;
+        s_acc_y = (float)ay / 32768.0f * 16.0f * G_ACC;
+        s_acc_z = (float)az / 32768.0f * 16.0f * G_ACC;
+        s_acc_last_ms = HAL_GetTick();
         float g    = (float)ay / 32768.0f * 16.0f;      /* g */
-        s_lat_acc  = g * G_ACC;                          /* m/s^2, 원본(bias 미반영) */
-        s_acc_ok++;
+        s_lat_acc  = g * G_ACC * IMU_LAT_ACC_SIGN;      /* m/s^2, 원본(bias 미반영) */
+        g_imu_acc_ok++;
         if (s_cal_active) {          /* 캘리브레이션 중이면 원본값을 누적 */
             s_cal_acc_sum += (double)s_lat_acc;
             s_cal_acc_count++;
@@ -139,7 +181,7 @@ static bool parse_packet(const uint8_t *p) {
 }
 
 void IMU_ProcessData(void) {
-    uint16_t w = dma_write_idx();
+    uint16_t w = s_idle_write;
 
     while (s_read_idx != w) {
         uint16_t avail = (w >= s_read_idx) ? (w - s_read_idx)
@@ -153,7 +195,7 @@ void IMU_ProcessData(void) {
 
         if (byte0 != WT_HEADER || (byte1 != WT_ACC && byte1 != WT_GYRO)) {
             s_read_idx = (s_read_idx + 1) % RX_BUF_SIZE;
-            s_resync++;
+            g_imu_resync++;
             continue;
         }
 
@@ -161,7 +203,11 @@ void IMU_ProcessData(void) {
         for (uint16_t i = 0; i < WT_PKT_LEN; i++)
             pkt[i] = s_rx[(s_read_idx + i) % RX_BUF_SIZE];
 
-        if (parse_packet(pkt)) {
+        uint32_t mask=__get_PRIMASK();__disable_irq();
+        bool parsed=parse_packet(pkt);
+        if(parsed)Timing_ImuPacket(pkt[1],s_byte_rx_us[(s_read_idx+WT_PKT_LEN-1u)%RX_BUF_SIZE],VehicleClock_Us32());
+        __set_PRIMASK(mask);
+        if (parsed) {
             s_read_idx = (s_read_idx + WT_PKT_LEN) % RX_BUF_SIZE;  /* 성공: 11바이트 점프 */
         } else {
             s_read_idx = (s_read_idx + 1) % RX_BUF_SIZE;  /* 실패: 1바이트만 이동해 재정렬 */
@@ -198,7 +244,7 @@ bool IMU_IsValid(void) {
 }
 
 /* ★실차 노이즈 대응: UART 프레이밍/오버런 에러나 커넥터 순간 단선으로 DMA가
- * 멈추면 IMU가 영구히 죽는다(이 프로젝트는 USART3_IRQn을 안 쓰므로 HAL의 에러
+ * 멈추면 IMU가 영구히 죽는다(이 프로젝트는 UART4_IRQn을 안 쓰므로 HAL의 에러
  * 콜백도 안 온다). 새 자이로 패킷이 한동안 없으면 UART/DMA를 통째로 재시작해
  * 스스로 복구한다. 메인 루프에서 주기적으로 호출할 것. */
 void IMU_Watchdog(void) {
@@ -209,15 +255,29 @@ void IMU_Watchdog(void) {
     if ((now - last_try)  <  IMU_DMA_RESTART_MS) return;   /* 재시작 폭주 방지 */
     last_try = now;
 
-    HAL_UART_DMAStop(&huart3);
-    __HAL_UART_CLEAR_OREFLAG(&huart3);
-    __HAL_UART_CLEAR_NEFLAG(&huart3);
-    __HAL_UART_CLEAR_FEFLAG(&huart3);
-    huart3.ErrorCode = HAL_UART_ERROR_NONE;
+    HAL_UART_DMAStop(&huart4);
+    __HAL_UART_CLEAR_OREFLAG(&huart4);
+    __HAL_UART_CLEAR_NEFLAG(&huart4);
+    __HAL_UART_CLEAR_FEFLAG(&huart4);
+    huart4.ErrorCode = HAL_UART_ERROR_NONE;
 
     s_read_idx = 0;
-    if (HAL_UART_Receive_DMA(&huart3, s_rx, RX_BUF_SIZE) == HAL_OK) {
-        s_dma_restart++;
+    s_idle_write=0;
+    if (HAL_UART_Receive_DMA(&huart4, s_rx, RX_BUF_SIZE) == HAL_OK) {
+        __HAL_UART_CLEAR_IDLEFLAG(&huart4);
+        __HAL_UART_ENABLE_IT(&huart4,UART_IT_IDLE);
+        g_imu_dma_restart++;
+    } else {
+        /* ★HAL이 BUSY/ERROR를 돌려주면 워치독이 매번 헛돌게 된다 — 이 경우
+         * 수신은 영영 안 살아난다. 아래 강제 리셋으로 상태머신을 풀어준다. */
+        g_imu_dma_fail++;
+        HAL_UART_Abort(&huart4);
+        huart4.RxState = HAL_UART_STATE_READY;
+        if (HAL_UART_Receive_DMA(&huart4, s_rx, RX_BUF_SIZE) == HAL_OK) {
+            __HAL_UART_CLEAR_IDLEFLAG(&huart4);
+            __HAL_UART_ENABLE_IT(&huart4,UART_IT_IDLE);
+            g_imu_dma_restart++;
+        }
     }
 }
 

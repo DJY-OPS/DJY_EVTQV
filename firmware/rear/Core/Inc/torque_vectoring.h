@@ -32,7 +32,10 @@ void TV_Reset(void);            /* PID 적분·슬루·ED 필터 상태 전부 �
  * ED를 별도로 끄는 건 조향각 자체를 못 믿을 때(SAS 고장)뿐이다. */
 void TV_SetTVEnabled(bool en);   /* 토글 스위치 + 안전판정 */
 void TV_SetEDEnabled(bool en);   /* SAS 유효할 때만 true */
-void TV_SetStrength(float fraction); /* 0..1, TV와 ED 최종 차동 강도 */
+
+/* ★ESP32(핏 컴퓨터)가 내려보내는 최종 차동 강도. TV/ED 양쪽 출력에 곱해진다.
+ * 게인은 공격적으로 두고 주행 중 강도만 조절하는 용도 — 재플래시 없이 수렴 가능. */
+void  TV_SetStrength(float fraction);   /* 0..1 */
 float TV_GetStrength(void);
 
 //

@@ -54,15 +54,37 @@
 #define LED_PORT        GPIOA
 #define LED_PIN         GPIO_PIN_5      /* PA5 — SPI1 리맵으로 확보됨 */
 
+/* ── 토크벡터링 on/off 토글 스위치 ─────────────────────────────────
+ * ★Board B(PC13)에서 이쪽으로 옮겨왔다. 스위치가 조종석에 있으니
+ *  앞 보드에서 읽는 게 배선상 훨씬 짧다. 읽은 상태는 0x100 프레임의
+ *  바이트4(SENSOR_FLAG_TV_SW)에 실어 Board B로 보낸다.
+ * ★핀 번호와 커넥터 위치(CN7-23)가 Board B에서 쓰던 것과 동일하므로
+ *  기존 스위치 하네스를 그대로 앞 보드에 옮겨 꽂으면 된다.
+ * ★PC13은 온보드 B1 유저 버튼과 공유된다. CubeMX 생성 코드가 EXTI로
+ *  잡아두지만, MX_GPIO_Init_2 USER CODE 블록에서 일반 입력(풀업)으로
+ *  다시 설정한다(그 블록이 생성 코드 뒤에 실행된다). */
+#define TV_SWITCH_PORT     GPIOC
+#define TV_SWITCH_PIN      GPIO_PIN_13   /* PC13 — CN7-23 */
+#define TV_SWITCH_ON_STATE GPIO_PIN_RESET /* 내부 풀업, 닫힘(GND)=ON */
+
+/* 기계식 접점 채터링 + 배선 유도 노이즈 방지 — 100Hz 기준 50ms */
+#define SWITCH_DEBOUNCE_TICKS 5u
+
 /* ── TPS 유효 범위 (12bit, 3.3V 기준) ──────────────────────────────
- *  ★실측(2026-08-06): 실제 페달 idle~풀프레스 전압 0.7V~2.5V.
- *   0.7V → 0.7/3.3*4095 ≈ 868  (0% 페달)
- *   2.5V → 2.5/3.3*4095 ≈ 3102 (100% 페달)
- *  단선(→0V)·단락(→3.3V) 진단용 밴드. MARGIN은 풀제로 페달 끝단에서
- *  오검출을 막기 위한 여유. */
-#define TPS_ADC_MIN     868u
-#define TPS_ADC_MAX     3102u
-#define TPS_ADC_MARGIN  50u
+ *  ★실측(2026-08-06, 벤치): 페달 idle~풀프레스 0.7V~2.5V → 868~3102
+ *  ★★실차 장착 후 재실측(2026-09): idle 880~890, 풀프레스 2790~2820.
+ *    페달 스토퍼가 센서 끝보다 먼저 닿아서 벤치값까지 안 올라간다.
+ *    ★Board B의 vehicle_params.h와 반드시 같은 값을 쓸 것 — 한쪽만 바꾸면
+ *     "앞 보드는 정상인데 뒤 보드는 폴트" 같은 모순이 생긴다.
+ *  단선(→0V)·단락(→3.3V) 진단용 밴드. MARGIN은 끝단 오검출 방지 여유.
+ *  밴드 = [685, 3020] */
+#define TPS_ADC_MIN     885u
+#define TPS_ADC_MAX     2820u
+/* ★Board B의 vehicle_params.h와 같은 값(50→200)으로 맞췄다. Board B는 페달
+ * 유격 대응으로 부팅 시 idle 위치를 ±150 범위에서 자동 학습하는데, 여기 마진이
+ * 좁으면 "B는 정상 판정인데 A는 TPS_ERR 하트비트를 쏘는" 불일치가 생긴다.
+ * 진짜 단선(→0 부근)/단락(→4095 부근)과는 여전히 한참 떨어져 있다. */
+#define TPS_ADC_MARGIN  200u
 
 #define CONTROL_FREQ_HZ 100u
 #define HEARTBEAT_DIV   10u    /* 100Hz / 10 = 10Hz */

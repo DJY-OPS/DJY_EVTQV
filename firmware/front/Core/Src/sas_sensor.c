@@ -17,6 +17,8 @@ extern SPI_HandleTypeDef hspi1;
 
 static uint16_t s_last_valid = 0;
 static bool     s_error      = false;
+static bool     s_io_ok      = true;
+bool SAS_LastIOOk(void) { return s_io_ok; }
 
 /* 16비트 even parity */
 static inline uint8_t even_parity(uint16_t v) {
@@ -35,7 +37,8 @@ static inline uint16_t cmd_read(uint16_t addr) {
 static uint16_t sas_xfer(uint16_t cmd) {
     uint16_t rx = 0;
     HAL_GPIO_WritePin(SAS_CS_PORT, SAS_CS_PIN, GPIO_PIN_RESET);
-    HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&cmd, (uint8_t *)&rx, 1, 2);
+    if(HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&cmd, (uint8_t *)&rx, 1, 2)!=HAL_OK)
+        s_io_ok=false;
     HAL_GPIO_WritePin(SAS_CS_PORT, SAS_CS_PIN, GPIO_PIN_SET);
     return rx;
 }
@@ -47,6 +50,7 @@ void SAS_Init(void) {
 }
 
 uint16_t SAS_ReadAngle(void) {
+    s_io_ok=true;
     const uint16_t cmd = cmd_read(AS5147_REG_ANGLECOM); /* = 0xFFFF */
 
     sas_xfer(cmd);                 /* 1) 명령 전송(직전 응답은 버림) */

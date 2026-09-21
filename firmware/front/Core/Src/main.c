@@ -26,10 +26,7 @@
 #include "tps_sensor.h"
 #include "can_comm.h"
 #include "can_messages.h"
-#include "driver_controls.h"
-#include "dial_inputs.h"
-#include "front_cli.h"
-#include "../../../../shared/include/djy_watchdog.h"
+#include "front_timing.h"
 
 /* USER CODE END Includes */
 
@@ -40,7 +37,26 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+/* ★★ CAN 배선 검증 모드 ★★
+ * 1 = 실제 TPS/SAS 대신 합성값(톱니파)을 CAN으로 내보낸다. 센서가 차량에
+ *     장착돼 있어 손으로 움직일 수 없을 때, "CAN 배선이 되는가"와
+ *     "센서가 되는가"를 분리해서 확인하는 용도.
+ *     Board B의 USART2 출력에서 tps= 값이 계속 변하면 CAN 경로 정상.
+ * 0 = 평소. 반드시 0으로 두고 차에 올릴 것.
+ *
+ * ★실차에 1로 올리면 매우 위험하다: 페달을 안 밟아도 TPS가 풀스케일까지
+ *  올라가므로 시스템이 전력을 요구한다. 반드시 구동계 분리 상태에서만 쓸 것. */
+#define CAN_TEST_MODE     0
 
+/* 테스트 파형 상수 (CAN_TEST_MODE 전용)
+ * 부팅 후 HOLD_TICKS 동안은 IDLE_VAL로 고정해 Board B의 TPS_LearnIdle()이
+ * 성공하게 한다 — 그래야 부팅 시점의 CAN 수신까지 함께 검증된다.
+ * ★IDLE_VAL을 기본값 868이 아닌 900으로 둔 이유: Board B가 "TPS idle: 900
+ *   (learned)"로 찍으면 기본값 폴백이 아니라 진짜 수신했다는 증거가 된다. */
+#define TEST_IDLE_VAL     900u
+#define TEST_HOLD_TICKS   300u   /* 100Hz 기준 3초 */
+#define TEST_TPS_STEP     8u     /* 톱니파 상승폭/틱 → 약 2.8초에 풀스윙 */
+#define TEST_SAS_STEP     40u    /* SAS(14비트)는 더 크게 — 약 4초에 한 바퀴 */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -60,9 +76,7 @@ TIM_HandleTypeDef htim6;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-static volatile uint8_t s_pending_10ms = 0;
-static uint8_t s_hb_counter = 0;
-static uint8_t s_led_counter = 0;
+static volatile uint8_t hb_counter = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -106,6 +120,7 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+  VehicleClock_Init();
 
   /* USER CODE END SysInit */
 
@@ -117,14 +132,12 @@ int main(void)
   MX_TIM6_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+  HAL_NVIC_SetPriority(USART2_IRQn, 3, 0);
+  HAL_NVIC_EnableIRQ(USART2_IRQn);
   SAS_Init();
-  TPS_Init();
-  DriverControls_Init();
-  DialInputs_Init();
-  CAN_Init();
-  FrontCli_Init();
-  DjyWatchdog_Init();
-  HAL_TIM_Base_Start_IT(&htim6);   /* 100Hz scheduler tick */
+     TPS_Init();
+     CAN_Init();
+     HAL_TIM_Base_Start_IT(&htim6);   /* 100Hz */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -134,38 +147,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    DjyWatchdog_Kick();
-    FrontCli_Process();
-    bool run_cycle = false;
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
-    if (s_pending_10ms > 0u) {
-      --s_pending_10ms;
-      run_cycle = true;
-    }
-    if (primask == 0u) __enable_irq();
-
-    if (run_cycle) {
-      uint16_t sas = SAS_ReadAngle();
-      uint16_t tps = TPS_ReadRaw();
-      DialInputs_Update10ms();
-      uint8_t status = HB_STATUS_OK;
-      if (SAS_HasError())    status |= HB_STATUS_SAS_ERR;
-      if (!TPS_IsValid(tps)) status |= HB_STATUS_TPS_ERR;
-
-      (void)CAN_SendSensorData(sas, tps);
-      DjyDriverControl control = DriverControls_NextMessage();
-      (void)CAN_SendDriverControl(&control);
-
-      if (++s_hb_counter >= HEARTBEAT_DIV) {
-        s_hb_counter = 0u;
-        (void)CAN_SendHeartbeat(status);
-      }
-      if (++s_led_counter >= 25u) {
-        s_led_counter = 0u;
-        HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
-      }
-    }
+    FrontTiming_Poll();
   }
   /* USER CODE END 3 */
 }
@@ -460,17 +442,102 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(SAS_CS_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-
+  /* ★TV 토글 스위치(PC13)를 EXTI가 아닌 일반 입력(풀업)으로 다시 잡는다.
+   * 위 생성 코드가 B1_Pin을 GPIO_MODE_IT_FALLING으로 설정하는데, 우리는
+   * 인터럽트가 아니라 100Hz ISR에서 폴링+디바운스로 읽는다. 이 블록이
+   * 생성 코드 뒤에 실행되므로 CubeMX 재생성에도 덮이지 않는다. */
+  {
+    GPIO_InitTypeDef sw = {0};
+    sw.Pin  = TV_SWITCH_PIN;
+    sw.Mode = GPIO_MODE_INPUT;
+    sw.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(TV_SWITCH_PORT, &sw);
+  }
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+/* 토크벡터링 토글 스위치 디바운스 — 기계식 접점 채터링과 배선에 유도된
+ * 노이즈로 TV가 깜빡깜빡 켜졌다 꺼지는 걸 막는다. SWITCH_DEBOUNCE_TICKS
+ * (50ms) 연속으로 같은 레벨이어야 상태를 바꾼다. 100Hz ISR에서만 호출.
+ * ★Board B에 있던 것과 동일한 로직 — 스위치를 앞 보드로 옮기면서 같이 왔다. */
+static bool TV_Switch_Debounced(void) {
+    static bool    stable = false;
+    static uint8_t count  = 0;
+
+    bool raw = (HAL_GPIO_ReadPin(TV_SWITCH_PORT, TV_SWITCH_PIN)
+                == TV_SWITCH_ON_STATE);
+    if (raw == stable) { count = 0; }
+    else if (++count >= SWITCH_DEBOUNCE_TICKS) { stable = raw; count = 0; }
+    return stable;
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     if (htim->Instance == TIM6) {
-        /* Keep blocking SPI/ADC transactions out of the highest-priority ISR.
-         * Two queued cycles are enough to absorb a short main-loop delay; a
-         * larger backlog would only replay stale samples. */
-        if (s_pending_10ms < 2u) ++s_pending_10ms;
+        uint32_t sample_start = VehicleClock_Us32();
+        uint16_t sas = SAS_ReadAngle();
+        uint32_t sas_end = VehicleClock_Us32();
+        uint16_t tps = TPS_ReadRaw();
+        uint32_t sample_end = VehicleClock_Us32();
+        uint8_t  flags = TV_Switch_Debounced() ? SENSOR_FLAG_TV_SW : 0u;
+
+        uint8_t status = HB_STATUS_OK;
+        if (SAS_HasError())    status |= HB_STATUS_SAS_ERR;
+        if (!TPS_IsValid(tps)) status |= HB_STATUS_TPS_ERR;
+
+#if CAN_TEST_MODE
+        /* ★TEMP: 실제 센서값을 버리고 합성 톱니파로 덮어쓴다.
+         * 상태 비트도 OK로 강제한다 — 차량에 장착된 실제 센서가 범위를
+         * 벗어나 에러를 띄우면 Board B의 세이프티가 걸려서, CAN이 멀쩡한데도
+         * 안 되는 것처럼 보이기 때문이다. */
+        {
+            static uint32_t t     = 0;
+            static uint16_t tps_w = TEST_IDLE_VAL;
+            static uint16_t sas_w = 8192u;   /* 14비트 중앙 */
+            static int16_t  sas_d = TEST_SAS_STEP;
+
+            if (t < TEST_HOLD_TICKS) {
+                t++;                      /* 부팅 직후: idle 고정 구간 */
+            } else {
+                tps_w += TEST_TPS_STEP;
+                if (tps_w > TPS_ADC_MAX) tps_w = TEST_IDLE_VAL;   /* 톱니파 */
+                /* ★SAS는 톱니파가 아니라 삼각파로 만든다. 0↔16383을 감싸면
+                 * Board B의 Deglitch가 그 순간을 이상치로 걸러서, 멀쩡한
+                 * 통신인데 값이 튀는 것처럼 보이기 때문이다. */
+                sas_w = (uint16_t)((int32_t)sas_w + sas_d);
+                if (sas_w > 12288u || sas_w < 4096u) sas_d = (int16_t)(-sas_d);
+            }
+            tps    = tps_w;
+            sas    = sas_w;
+            status = HB_STATUS_OK;
+        }
+#endif
+
+        uint32_t span = sample_end - sample_start;
+        // Midpoint of the acquisition interval, not simultaneous SPI/ADC sampling.
+        bool enqueued=BoardTimeSync_SendSensor(sas, tps, flags, sample_start + span/2u,
+                                      (uint16_t)(span > 65535u ? 65535u : span));
+        uint32_t enqueue_end=VehicleClock_Us32();
+
+        if (++hb_counter >= HEARTBEAT_DIV) {
+            CAN_SendHeartbeat(status);
+            hb_counter = 0;
+        }
+        HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
+        static uint32_t timing_seq,previous_start;
+        FrontTimingSample timing={0};
+        timing.seq=++timing_seq;timing.started=sample_start;
+        timing.period=timing_seq>1?sample_start-previous_start:0;
+        previous_start=sample_start;
+        timing.sas_us=sas_end-sample_start;
+        timing.tps_us=sample_end-sas_end;timing.acquire_us=span;
+        timing.enqueue_us=enqueue_end-sample_start;
+        timing.sas=sas;timing.tps=tps;
+        timing.flags=(SAS_HasError()?1u:0u)|(!TPS_IsValid(tps)?2u:0u)|
+                     (!SAS_LastIOOk()?4u:0u)|(!TPS_LastIOOk()?8u:0u)|(!enqueued?16u:0u);
+        timing.esr=hcan1.Instance->ESR;
+        timing.work_us=VehicleClock_Us32()-sample_start;
+        FrontTiming_Record(&timing);
     }
 }
 

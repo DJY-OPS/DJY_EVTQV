@@ -18,7 +18,13 @@ static PID_State s_pid;
 static bool      s_tv_enabled = false;
 static bool      s_ed_enabled = true;    /* SAS가 멀쩡한 한 항상 켜둔다 */
 static float     s_dp_prev    = 0.0f;    /* 슬루 리미터 상태 */
-static float     s_strength   = 0.0f;    /* 유효 설정 수신 전에는 50:50 */
+
+/* ★ESP32(핏 컴퓨터)에서 내려오는 최종 차동 강도 0..1. TV와 ED 양쪽에 곱해진다.
+ * 게인을 공격적으로 잡아두고 주행 중에 강도만 내려서 쓸 수 있게 하는 손잡이다.
+ * ★초기값은 TV_STRENGTH_NO_ESP — ESP 링크가 없는 구성에서 TV가 조용히 죽어버리는
+ *  걸 막는다. 팀원 원본은 0.0(= ESP 명령이 있어야만 개입)이었는데, 지금은 ESP32
+ *  없이도 주행하므로 기본값을 1.0으로 두고 vehicle_params.h에서 바꾸게 했다. */
+static float     s_strength   = TV_STRENGTH_NO_ESP;
 
 void TV_Init(void) {
     PID_Init(&s_pid, PID_KP, PID_KI, PID_KD, PID_INTEGRAL_MAX, PID_OUTPUT_MAX);
@@ -26,8 +32,11 @@ void TV_Init(void) {
     s_tv_enabled = false;
     s_ed_enabled = true;
     s_dp_prev    = 0.0f;
-    s_strength   = 0.0f;
+    s_strength   = TV_STRENGTH_NO_ESP;
 }
+
+void  TV_SetStrength(float fraction) { s_strength = CLAMP(fraction, 0.0f, 1.0f); }
+float TV_GetStrength(void)           { return s_strength; }
 
 /* ★STOP 진입 시 반드시 호출할 것. 예전엔 STOP이면 TV_Update() 자체를 안 불러서
  * PID 적분값이 그대로 남아 있었고, 폴트가 풀리는 순간 쌓여있던 적분항이 한꺼번에
@@ -40,8 +49,6 @@ void TV_Reset(void) {
 
 void TV_SetTVEnabled(bool en) { s_tv_enabled = en; }
 void TV_SetEDEnabled(bool en) { s_ed_enabled = en; }
-void TV_SetStrength(float fraction) { s_strength = CLAMP(fraction, 0.0f, 1.0f); }
-float TV_GetStrength(void) { return s_strength; }
 
 /* 모터 RPM(TIM3 Input Capture 실측) → 차속[m/s]. 체인 감속비 반영. */
 static float compute_speed(uint16_t rpm_l, uint16_t rpm_r) {
@@ -73,24 +80,32 @@ static float traction_scale(float v, float yaw_rate_meas, float lat_acc_meas) {
 /* 속도 의존 ΔP 상한 — 좌우 구동력 차 ΔF = ΔP/v 가 타이어 한계를 넘지 않게.
  * 저속일수록 같은 kW가 훨씬 큰 힘이 되므로 이 제한이 없으면 저속 코너에서
  * 안쪽 바퀴가 완전히 죽고 바깥쪽이 휠스핀한다. (vehicle_params.h 주석 참고) */
-static float delta_power_limit(float v) {
-    float by_force = DELTA_FORCE_MAX_N * v * 0.001f;   /* N·m/s → kW */
-    return fminf(DELTA_POWER_MAX_KW, by_force);
+/* ★세 번째 제한: 운전자 요구량에 비례한 상한.
+ *  앞의 두 제한(kW 천장, ΔF)은 **스로틀과 무관**해서, 부분 스로틀에서
+ *  ΔP가 base를 넘어버리면 안쪽 바퀴가 0으로 깎인다:
+ *      30% 스로틀 → base 1.425kW, ΔP 4.5 → 안쪽 0 / 바깥 2.85 (한쪽 구동)
+ *  합계는 보존되지만 토크가 한 바퀴에 몰려 헛돌기 쉽고, 운전자는
+ *  "TV 켜면 출력이 낮다"고 느낀다(2026-09 실주행 피드백).
+ *  요구량에 비례해 묶으면 안쪽 바퀴가 항상 (1−FRAC)/2 만큼은 살아있다. */
+static float delta_power_limit(float v, float p_demand) {
+    float by_force  = DELTA_FORCE_MAX_N * v * 0.001f;   /* N·m/s → kW */
+    float by_demand = TV_DELTA_DEMAND_FRAC * p_demand;
+    return fminf(fminf(DELTA_POWER_MAX_KW, by_force), by_demand);
 }
 
-/* kW → DAC 코드 (컨트롤러 전압 매핑의 정확한 역함수) */
+/* kW → DAC 코드 (컨트롤러 전압 매핑의 정확한 역함수)
+ * ★외부 MCP4822는 게인 2배에서 1LSB = 1mV라 "전압×1000"이 곧 코드다.
+ *   내부 DAC 시절의 (v/3.3*4095) 환산이 사라져 계산이 단순해졌다. */
 static uint16_t power_to_dac(float P_kW) {
     float v;
     if (P_kW <= P_OFF_EPS_KW) v = V_THROTTLE_OFF;          /* 0.90V → 0kW 보장 */
     else                      v = V_CTRL_0KW + P_kW * V_PER_KW;
 
-    /* ★예전엔 P >= MOTOR_MAX_KW에서 V_THROTTLE_FULL(3.30V)로 점프시켰는데,
-     * 6.99kW→3.1997V, 7.00kW→3.30V 로 0.1V 계단이 생기는 버그였다. 이제는
-     * 전 구간 하나의 선형식만 쓰고 상단은 V_DAC_MAX_V로 자른다.
-     * V_DAC_MAX_V(3.10V)는 DAC 출력버퍼의 물리적 한계다. 풀스케일을 3.00V로
-     * 낮춘 뒤로는 7kW에서도 3.00V라 이 클램프에 걸리지 않는다(안전망으로만 남음). */
+    /* 전 구간 하나의 선형식만 쓰고 상단은 V_DAC_MAX_V(3.20V)로 자른다.
+     * 정상 동작에서 최대는 7kW→3.00V라 이 클램프에 안 걸린다. 스케일링 버그로
+     * 4V가 컨트롤러 스로틀에 나가는 사고를 막는 안전망이다. */
     v = CLAMP(v, 0.0f, V_DAC_MAX_V);
-    float code = v / DAC_VREF * (float)DAC_RESOLUTION;
+    float code = v * DAC_CODE_PER_V;
     return (uint16_t)CLAMP(code, 0.0f, (float)DAC_RESOLUTION);
 }
 
@@ -101,6 +116,7 @@ void TV_Update(TV_t *tv) {
 
     /* 운전자 요구 총전력과 기준 분배 (제로섬의 기준점) */
     float P_demand = CLAMP(tv->tps_fraction, 0.0f, 1.0f) * P_SUM_MAX_KW;
+    P_demand = fminf(P_demand, 2.0f * MOTOR_MAX_KW);
     float base     = 0.5f * P_demand;
 
     /* ── TV / ED 배타 중재 ──────────────────────────────────────────
@@ -122,11 +138,11 @@ void TV_Update(TV_t *tv) {
 
         /* 횡G 불일치(트랙션 상실) 감지되면 개입을 줄인다 */
         float tscale = traction_scale(v, tv->imu_yaw_rate,
-                                      IMU_LAT_ACC_SIGN * IMU_GetLateralAcc());
+                                      IMU_GetLateralAcc());   /* 부호는 imu_sensor.c에서 이미 적용 */
         dP_raw *= tscale;
 
         /* 저속 과대개입 방지 (ΔF 한계) */
-        float lim = delta_power_limit(v);
+        float lim = delta_power_limit(v, P_demand);
         dP_raw = CLAMP(dP_raw, -lim, lim);
 
         tv->desired_yaw    = psi_ref;
@@ -142,20 +158,32 @@ void TV_Update(TV_t *tv) {
         tv->yaw_error      = 0.0f;
         tv->traction_scale = 1.0f;
 
+        /* 페달 해제/차동 금지 뒤에 이전 ED 필터값을 재사용하지 않는다. */
+        if (P_demand <= P_OFF_EPS_KW || !s_ed_enabled) ED_Reset();
+
         /* ED: 개루프 애커만 차동. IMU 전혀 사용 안 함. */
         dP_raw = ED_ComputeDeltaPower(delta, ed_active ? P_demand : 0.0f, v);
     }
 
-    /* 운전자 설정은 PID 게인을 바꾸지 않고 최종 차동량에만 적용한다. 이 방식은
-     * 폐루프 안정성을 유지하면서 TV와 ED의 체감 강도를 같은 의미로 조절한다. */
+    /* ★ESP32 강도 스케일 — TV/ED 어느 쪽이 만든 값이든 여기서 한 번에 곱한다.
+     * 슬루 리미터보다 앞에 둬야 강도를 내릴 때도 변화율 제한이 걸린다. */
     dP_raw *= s_strength;
 
     /* 최종 변화율 제한 — TV↔ED 전환 시 계단을 없애고(둘을 동시에 켜서 블렌딩
      * 하지 않아도 매끄럽게 넘어간다), 남은 센서 노이즈가 출력으로 새는 것도 막는다. */
     float dP = SlewLimit(s_dp_prev, dP_raw, DELTA_POWER_SLEW_KW_S * CONTROL_DT);
-    s_dp_prev = dP;
 
-    tv->delta_power = dP;
+    /* 최신 페달/모터 한계는 슬루 상태보다 우선한다. 제한을 슬루 앞에만 두면
+     * 페달을 줄인 직후 이전의 큰 차동이 남아 한쪽 출력이 0이 될 수 있다.
+     * |dP| <= min(P, 2*M-P)이면 합계 P를 유지하면서 양쪽이 [0,M]에 든다.
+     * TV/ED 모두 요구량 비율 제한을 지키고, TV만 속도별 구동력 제한을 쓴다. */
+    float demand_limit = CLAMP(TV_DELTA_DEMAND_FRAC, 0.0f, 1.0f) * P_demand;
+    float motor_limit = fmaxf(0.0f, 2.0f * MOTOR_MAX_KW - P_demand);
+    float mode_limit = tv_active ? delta_power_limit(v, P_demand)
+                                : (ed_active ? ED_DELTA_MAX_KW : 0.0f);
+    float final_limit = fmaxf(0.0f, fminf(fminf(demand_limit, motor_limit), mode_limit));
+    dP = CLAMP(dP, -final_limit, final_limit);
+
     tv->tv_active   = tv_active;
     tv->ed_active   = ed_active;
 
@@ -163,18 +191,7 @@ void TV_Update(TV_t *tv) {
     float PL = base - 0.5f * dP;
     float PR = base + 0.5f * dP;
 
-    /* 차동보존 클램프: 바깥이 모터 한계를 넘으면, 초과분을 안쪽에서
-     * 추가로 빼서 차동(ΔP)을 유지한다. (기존: 바깥만 잘라 차동 손실) */
-    if (PR > MOTOR_MAX_KW) { float ex = PR - MOTOR_MAX_KW; PR = MOTOR_MAX_KW; PL -= ex; }
-    if (PL > MOTOR_MAX_KW) { float ex = PL - MOTOR_MAX_KW; PL = MOTOR_MAX_KW; PR -= ex; }
-
-    /* ★음수(하한) 클램프도 위와 동일하게 제로섬 보존해야 한다 — 안 그러면
-     * 한쪽이 0으로 잘리는 만큼 반대쪽에서도 빼주지 않아 합계가 P_demand를
-     * 초과해서(운전자 요청보다 더 많은 힘이 나가는) 안전 문제가 생긴다. */
-    if (PR < 0.0f) { float ex = -PR; PR = 0.0f; PL -= ex; }
-    if (PL < 0.0f) { float ex = -PL; PL = 0.0f; PR -= ex; }
-
-    /* 최종 안전망 (위 로직으로 이미 [0, MOTOR_MAX_KW] 안에 있어야 정상) */
+    /* final_limit로 이미 범위 안이다. 부동소수점 반올림에 대한 안전망. */
     PL = CLAMP(PL, 0.0f, MOTOR_MAX_KW);
     PR = CLAMP(PR, 0.0f, MOTOR_MAX_KW);
 
@@ -187,6 +204,8 @@ void TV_Update(TV_t *tv) {
 
     tv->power_left  = PL;
     tv->power_right = PR;
+    tv->delta_power = PR - PL;  /* 배분 전 요청이 아니라 실제 좌우 명령 차이 */
+    s_dp_prev = tv->delta_power;
     tv->dac_left    = power_to_dac(PL);
     tv->dac_right   = power_to_dac(PR);
 }

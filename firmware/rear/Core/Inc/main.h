@@ -63,14 +63,12 @@ void Error_Handler(void);
 #define USART_TX_GPIO_Port GPIOA
 #define USART_RX_Pin GPIO_PIN_3
 #define USART_RX_GPIO_Port GPIOA
-#define DAC_LEFT_Pin GPIO_PIN_4
-#define DAC_LEFT_GPIO_Port GPIOA
-#define DAC_RIGHT_Pin GPIO_PIN_5
-#define DAC_RIGHT_GPIO_Port GPIOA
 #define LED_Pin GPIO_PIN_0
 #define LED_GPIO_Port GPIOB
 #define SD_CS_Pin GPIO_PIN_1
 #define SD_CS_GPIO_Port GPIOB
+#define DAC_CS_Pin GPIO_PIN_11
+#define DAC_CS_GPIO_Port GPIOC
 #define SWO_Pin GPIO_PIN_3
 #define SWO_GPIO_Port GPIOB
 

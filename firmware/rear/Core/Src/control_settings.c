@@ -15,6 +15,20 @@ static uint8_t s_regen_ramp_units;
 static uint8_t s_pit_flags;
 static uint16_t s_tv_ramp_tenths;
 
+static void update_tv_slew(void) {
+    s_tv_ramp_tenths += s_tv_ramp_units;
+    uint8_t step = (uint8_t)(s_tv_ramp_tenths / 10u);
+    s_tv_ramp_tenths %= 10u;
+    if (step == 0u) return;
+    if (s_tv_applied < s_tv_target) {
+        uint16_t next = (uint16_t)s_tv_applied + step;
+        s_tv_applied = next > s_tv_target ? s_tv_target : (uint8_t)next;
+    } else if (s_tv_applied > s_tv_target) {
+        int16_t next = (int16_t)s_tv_applied - step;
+        s_tv_applied = next < (int16_t)s_tv_target ? s_tv_target : (uint8_t)next;
+    }
+}
+
 void ControlSettings_Init(void) {
     s_tv_target = 0u;
     s_tv_applied = 0u;
@@ -60,20 +74,24 @@ void ControlSettings_Update10ms(const DjyDriverControl *received, bool fresh) {
         s_flags = 0u;
     }
 
-    s_tv_ramp_tenths += s_tv_ramp_units;
-    uint8_t step = (uint8_t)(s_tv_ramp_tenths / 10u);
-    s_tv_ramp_tenths %= 10u;
-    if (step == 0u) return;
-    if (s_tv_applied < s_tv_target) {
-        uint16_t next = (uint16_t)s_tv_applied + step;
-        s_tv_applied = next > s_tv_target ? s_tv_target : (uint8_t)next;
-    } else if (s_tv_applied > s_tv_target) {
-        int16_t next = (int16_t)s_tv_applied - step;
-        s_tv_applied = next < (int16_t)s_tv_target ? s_tv_target : (uint8_t)next;
-    }
+    update_tv_slew();
+}
+
+void ControlSettings_UpdateEsp10ms(uint8_t requested_percent,
+                                   uint8_t limit_percent,
+                                   bool enabled) {
+    s_fresh = true;
+    s_tv_limit = limit_percent <= 100u ? limit_percent : 100u;
+    s_tv_target = requested_percent < s_tv_limit ? requested_percent : s_tv_limit;
+    if (!enabled) s_tv_target = 0u;
+    s_regen_requested = 0u;
+    s_mode = DJY_MODE_RACE;
+    s_flags = enabled ? DJY_CONTROL_FLAG_TV_ENABLE : 0u;
+    update_tv_slew();
 }
 
 uint8_t ControlSettings_GetTvAppliedPercent(void) { return s_tv_applied; }
+uint8_t ControlSettings_GetTvTargetPercent(void) { return s_tv_target; }
 uint8_t ControlSettings_GetRegenRequestedPercent(void) { return s_regen_requested; }
 
 /* Deliberately held at zero until the ND72680B regen command pin/protocol,

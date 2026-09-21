@@ -5,6 +5,9 @@
 #include "main.h"
 #include <string.h>
 #include <stdio.h>
+#include "board_time_sync.h"
+#include "vehicle_clock.h"
+#include "sensor_time_pair.h"
 
 /* CubeMX: CAN1 RX=PA11 / TX=PA12 (board_config.h), 500kbps, RX FIFO0 인터럽트 */
 extern CAN_HandleTypeDef hcan1;
@@ -13,21 +16,14 @@ extern UART_HandleTypeDef huart2;
 static volatile SensorData_t s_sensor = {0};
 static volatile MotorRPM_t   s_rpm    = {0};
 static volatile uint8_t      s_hb      = 0;
+/* ★TV on/off 토글 스위치 — Board B의 PC13에서 Board A로 옮겼다(운전석 배선).
+ * 0x100 프레임 바이트4로 매 틱(100Hz) 들어온다. 디바운스는 송신측에서 이미
+ * 끝내서 보내므로 여기서 또 할 필요가 없다. */
+static volatile bool         s_tv_switch = false;
 static volatile uint32_t     s_t_sensor = 0, s_t_left = 0, s_t_right = 0, s_t_hb = 0;
-static volatile DjyDriverControl s_control = {0};
-static volatile uint32_t s_t_control = 0;
-static volatile bool s_control_seen = false;
-static volatile uint8_t s_control_sequence = 0;
-static volatile uint32_t s_control_error_count = 0;
-static volatile uint32_t s_tx_drop_count = 0;
-static CAN_TxHeaderTypeDef s_tx_rear_status;
-static CAN_TxHeaderTypeDef s_tx_pit_ack;
-static CAN_TxHeaderTypeDef s_tx_drivetrain;
-static volatile DjyPitConfig s_pit_config = {0};
-static volatile uint32_t s_t_pit_config = 0;
-static volatile bool s_pit_config_seen = false;
-
-#define DRIVER_CONTROL_TIMEOUT_MS 150u
+static SensorTimePair sensor_pair;
+static volatile SensorTiming_t sensor_timing;
+SensorTiming_t CAN_GetSensorTiming(void) { return sensor_timing; }
 
 /* ★TEMP 스니퍼: Fardriver ND72680B가 실제 어떤 CAN ID/바이트에 RPM을 싣는지
  * 모르므로, 들어오는 모든 ID의 최신 프레임을 슬롯에 담아둔다. Live Expression에
@@ -69,9 +65,13 @@ static void sniff_record(uint32_t id, bool ext, const uint8_t *d, uint8_t len, u
 }
 
 /* ★TEMP: 버스에 뭔가 오다가 깨지는 건지, 아예 무신호인지 구분하기 위한
- * 에러 카운터. Live Expression으로 s_can_err_count / s_can_last_esr 확인. */
-static volatile uint32_t s_can_err_count = 0;
-static volatile uint32_t s_can_last_esr  = 0;
+ * 카운터. USART2 디버그 출력의 can=rx/err/esr 필드로 나온다.
+ *   rx  = 수신한 프레임 총수(ID 무관). 0이면 버스가 완전히 조용하다.
+ *   err = 버스 레벨 에러 횟수. 신호는 오는데 깨지면 이쪽이 올라간다.
+ *   esr = 마지막 에러의 ESR 레지스터(LEC 필드로 에러 종류 식별). */
+volatile uint32_t g_can_rx_count  = 0;
+volatile uint32_t g_can_err_count = 0;
+volatile uint32_t g_can_last_esr  = 0;
 
 void CAN_Init(void) {
     /* 0x100, 0x200, 0x201, 0x300 수신. 단순화를 위해 전수락 후 콜백에서 분기. */
@@ -96,100 +96,70 @@ void CAN_Init(void) {
     SET_BIT(hcan1.Instance->MCR, CAN_MCR_ABOM);
     hcan1.Init.AutoBusOff = ENABLE;   /* HAL 내부 상태와 일치시킴 */
 
-    s_tx_rear_status.StdId = DJY_CAN_ID_REAR_STATUS;
-    s_tx_rear_status.IDE = CAN_ID_STD;
-    s_tx_rear_status.RTR = CAN_RTR_DATA;
-    s_tx_rear_status.DLC = DJY_CAN_DLC_REAR_STATUS;
-    s_tx_rear_status.TransmitGlobalTime = DISABLE;
-
-    s_tx_pit_ack = s_tx_rear_status;
-    s_tx_pit_ack.StdId = DJY_CAN_ID_PIT_CONFIG_ACK;
-    s_tx_pit_ack.DLC = DJY_CAN_DLC_PIT_CONFIG;
-    s_tx_drivetrain = s_tx_rear_status;
-    s_tx_drivetrain.StdId = DJY_CAN_ID_REAR_DRIVETRAIN;
-    s_tx_drivetrain.DLC = DJY_CAN_DLC_REAR_DRIVETRAIN;
-
-    (void)HAL_CAN_Start(&hcan1);
-    (void)HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
-    (void)HAL_CAN_ActivateNotification(&hcan1, CAN_IT_ERROR | CAN_IT_BUSOFF |
-                                                CAN_IT_LAST_ERROR_CODE);
+    HAL_CAN_Start(&hcan1);
+    BoardTimeSync_Init(true);
+    HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
+    HAL_CAN_ActivateNotification(&hcan1, CAN_IT_ERROR | CAN_IT_BUSOFF |
+                                          CAN_IT_LAST_ERROR_CODE);
 }
 
 /* ★TEMP: 버스 레벨 에러(폼/스터프/ACK/CRC 에러, Bus-off 등) 발생 시 호출됨.
  * 뭔가 신호는 오는데 깨지는 상황이면 이 카운터가 계속 늘어난다. */
 void HAL_CAN_ErrorCallback(CAN_HandleTypeDef *hcan) {
-    s_can_err_count++;
-    s_can_last_esr = hcan->Instance->ESR;
+    g_can_err_count++;
+    g_can_last_esr = hcan->Instance->ESR;
 }
 
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
+    uint32_t received_us=VehicleClock_Us32();
     CAN_RxHeaderTypeDef h;
     uint8_t d[8];
     if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &h, d) != HAL_OK) return;
     uint32_t now = HAL_GetTick();
+    g_can_rx_count++;   /* ★ID 무관 총 수신 프레임 수 — 버스가 조용한지 판별용 */
 
     bool     ext = (h.IDE == CAN_ID_EXT);
     uint32_t id  = ext ? h.ExtId : h.StdId;
     sniff_record(id, ext, d, (uint8_t)h.DLC, now);   /* ★TEMP: RPM/컨트롤러 프레임 위치 찾는 중 */
-
-    /* Only standard data frames may enter the vehicle-control state. Extended
-     * frames remain visible to the temporary sniffer above but are never parsed
-     * using StdId by accident. */
-    if (h.IDE != CAN_ID_STD || h.RTR != CAN_RTR_DATA) return;
+    if(ext || h.RTR!=CAN_RTR_DATA)return;
+    if(BoardTimeSync_OnCan(id,d,(uint8_t)h.DLC,received_us))return;
+    if(id==TS_ID_SENSOR_TIME || (id==CAN_ID_SENSOR_DATA && h.DLC==8u && d[7]==TS_SENSOR_MARKER)) {
+        if(SensorTimePair_Push(&sensor_pair,id,d,(uint8_t)h.DLC,received_us)) {
+            /* TIM6 has higher priority than CAN RX. Publish values and their
+             * timestamp together so a control tick cannot observe half a pair. */
+            uint32_t mask=__get_PRIMASK();__disable_irq();
+            s_sensor.sas_angle=can_unpack_u16(sensor_pair.data)&0x3fffu;
+            s_sensor.tps_raw=can_unpack_u16(sensor_pair.data+2)&0xfffu;
+            s_tv_switch=(sensor_pair.data[4]&SENSOR_FLAG_TV_SW)!=0;
+            sensor_timing=(SensorTiming_t){sensor_pair.front_us,received_us,
+                                          sensor_pair.span,sensor_pair.data_seq,true};
+            s_t_sensor=now;
+            __set_PRIMASK(mask);
+        }
+        return;
+    }
 
     switch (h.StdId) {
         case CAN_ID_SENSOR_DATA:
-            if (h.DLC != DJY_CAN_DLC_SENSOR_DATA) break;
+            if(h.DLC<4u)return;
+            sensor_timing=(SensorTiming_t){0,received_us,0,0,false};
+            /* ★DLC가 5 미만이면 구버전 Board A다 — 플래그 바이트가 아예 없으므로
+             * 0(TV OFF)으로 둔다. 두 보드를 따로 플래시했을 때 쓰레기값을 읽고
+             * TV가 멋대로 켜지는 걸 막는 방어다. */
+            s_tv_switch = (h.DLC >= 5u) && ((d[4] & SENSOR_FLAG_TV_SW) != 0u);
             s_sensor.sas_angle = can_unpack_u16(&d[0]) & 0x3FFFu;
             s_sensor.tps_raw   = can_unpack_u16(&d[2]) & 0x0FFFu;
             s_t_sensor = now;
             break;
-        case DJY_CAN_ID_DRIVER_CONTROL: {
-            if (h.DLC != DJY_CAN_DLC_DRIVER_CONTROL) {
-                ++s_control_error_count;
-                break;
-            }
-            DjyDriverControl decoded;
-            if (!djy_unpack_driver_control(&decoded, d)) {
-                ++s_control_error_count;
-                break;
-            }
-            /* A repeated counter is not allowed to refresh the timeout, so a
-             * replayed/stuck frame cannot keep differential control alive. */
-            if (s_control_seen && decoded.sequence == s_control_sequence) {
-                ++s_control_error_count;
-                break;
-            }
-            s_control = decoded;
-            s_control_sequence = decoded.sequence;
-            s_control_seen = true;
-            s_t_control = now;
-            break;
-        }
-        case DJY_CAN_ID_PIT_CONFIG: {
-            DjyPitConfig decoded;
-            if (h.DLC != DJY_CAN_DLC_PIT_CONFIG ||
-                !djy_unpack_pit_config(&decoded, d)) {
-                ++s_control_error_count;
-                break;
-            }
-            s_pit_config = decoded;
-            s_pit_config_seen = true;
-            s_t_pit_config = now;
-            break;
-        }
         case CAN_ID_LEFT_RPM:
-            if (h.DLC < 2u) break;
             s_rpm.left = can_unpack_u16(&d[0]);   /* rpm = raw */
             s_t_left   = now;
             break;
         case CAN_ID_RIGHT_RPM:
-            if (h.DLC < 2u) break;
             s_rpm.right = can_unpack_u16(&d[0]);  /* rpm = raw */
             s_t_right   = now;
             break;
         case CAN_ID_HEARTBEAT:
-            if (h.DLC != DJY_CAN_DLC_HEARTBEAT) break;
             s_hb   = d[0];
             s_t_hb = now;
             break;
@@ -209,6 +179,13 @@ uint8_t CAN_GetHeartbeatStatus(void) { return s_hb; }
 bool CAN_IsSensorFresh(void) {
     return (HAL_GetTick() - s_t_sensor) <= CAN_TIMEOUT_MS;
 }
+
+/* ★프레임이 stale이면 무조건 OFF로 본다. 통신이 끊긴 상태에서 마지막으로
+ * 받은 ON을 계속 붙들고 있으면, 운전자가 스위치를 내려도 TV가 안 꺼진다.
+ * OFF로 떨어지면 ED(개루프, IMU 불필요)가 대신 동작하므로 안전한 폴백이다. */
+bool CAN_IsTVSwitchOn(void) {
+    return s_tv_switch && CAN_IsSensorFresh();
+}
 /* 하트비트(10Hz)의 상태 비트를 믿어도 되는지 — 오래된 비트로 SAS 폴트를
  * 판정하면 이미 복구된 고장이 계속 남아있게 된다. */
 bool CAN_IsHeartbeatFresh(void) {
@@ -221,77 +198,6 @@ bool CAN_IsRpmFresh(void) {
     return ((now - s_t_left)  <= RPM_TIMEOUT_MS) &&
            ((now - s_t_right) <= RPM_TIMEOUT_MS);
 }
-
-DjyDriverControl CAN_GetDriverControl(void) {
-    DjyDriverControl control;
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
-    control = s_control;
-    if (primask == 0u) __enable_irq();
-    return control;
-}
-
-bool CAN_IsDriverControlFresh(void) {
-    uint32_t timestamp = s_t_control;
-    return s_control_seen && timestamp != 0u &&
-           (HAL_GetTick() - timestamp) <= DRIVER_CONTROL_TIMEOUT_MS;
-}
-
-bool CAN_SendRearStatus(const DjyRearStatus *status) {
-    uint8_t data[8];
-    uint32_t mailbox;
-    djy_pack_rear_status(data, status);
-    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0u ||
-        HAL_CAN_AddTxMessage(&hcan1, &s_tx_rear_status, data, &mailbox) != HAL_OK) {
-        ++s_tx_drop_count;
-        return false;
-    }
-    return true;
-}
-
-bool CAN_GetPendingPitConfig(DjyPitConfig *config, uint8_t last_applied_sequence) {
-    if (config == 0 || !s_pit_config_seen ||
-        (HAL_GetTick() - s_t_pit_config) > 250u ||
-        s_pit_config.sequence == last_applied_sequence) {
-        return false;
-    }
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
-    *config = s_pit_config;
-    if (primask == 0u) __enable_irq();
-    return true;
-}
-
-bool CAN_SendPitConfigAck(const DjyPitConfig *config) {
-    uint8_t data[8];
-    uint32_t mailbox;
-    djy_pack_pit_config(data, config);
-    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0u ||
-        HAL_CAN_AddTxMessage(&hcan1, &s_tx_pit_ack, data, &mailbox) != HAL_OK) {
-        ++s_tx_drop_count;
-        return false;
-    }
-    return true;
-}
-
-bool CAN_SendRearDrivetrain(uint16_t rpm_left, uint16_t rpm_right,
-                            uint16_t dac_left, uint16_t dac_right) {
-    uint8_t data[8];
-    uint32_t mailbox;
-    djy_can_pack_u16(&data[0], rpm_left);
-    djy_can_pack_u16(&data[2], rpm_right);
-    djy_can_pack_u16(&data[4], dac_left);
-    djy_can_pack_u16(&data[6], dac_right);
-    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0u ||
-        HAL_CAN_AddTxMessage(&hcan1, &s_tx_drivetrain, data, &mailbox) != HAL_OK) {
-        ++s_tx_drop_count;
-        return false;
-    }
-    return true;
-}
-
-uint32_t CAN_GetControlErrorCount(void) { return s_control_error_count; }
-uint32_t CAN_GetTxDropCount(void) { return s_tx_drop_count; }
 
 /* =====================================================================
  *  ★TEMP: 컨트롤러 CAN H/L 스니핑 도구 (CAN_SNIFF_MODE 전용)
@@ -361,7 +267,7 @@ static void sniff_reinit_can(uint16_t prescaler) {
 
 static void sniff_clear(void) {
     for (int i = 0; i < SNIFF_SLOTS; i++) s_sniff[i].count = 0;
-    s_can_err_count = 0;
+    g_can_err_count = 0;
 }
 
 static uint32_t sniff_total_frames(void) {
@@ -403,7 +309,7 @@ void CAN_SniffSweep(void) {
         HAL_Delay(1000);   /* 1초간 수신 */
 
         uint32_t frames = sniff_total_frames();
-        uint32_t errs    = s_can_err_count;
+        uint32_t errs    = g_can_err_count;
 
         char line[96];
         int n = snprintf(line, sizeof(line),

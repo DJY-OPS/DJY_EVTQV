@@ -169,10 +169,6 @@ void HAL_CAN_MspInit(CAN_HandleTypeDef* hcan)
     GPIO_InitStruct.Alternate = GPIO_AF9_CAN1;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    /* CAN1 RX0 interrupt for rear acknowledgement/status frames. */
-    HAL_NVIC_SetPriority(CAN1_RX0_IRQn, 1, 0);
-    HAL_NVIC_EnableIRQ(CAN1_RX0_IRQn);
-
     /* USER CODE BEGIN CAN1_MspInit 1 */
 
     /* USER CODE END CAN1_MspInit 1 */
@@ -202,8 +198,6 @@ void HAL_CAN_MspDeInit(CAN_HandleTypeDef* hcan)
     PA12     ------> CAN1_TX
     */
     HAL_GPIO_DeInit(GPIOA, GPIO_PIN_11|GPIO_PIN_12);
-
-    HAL_NVIC_DisableIRQ(CAN1_RX0_IRQn);
 
     /* USER CODE BEGIN CAN1_MspDeInit 1 */
 

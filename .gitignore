@@ -11,3 +11,8 @@
 *.su
 *.cyclo
 
+
+__pycache__/
+*.pyc
+*.exe
+

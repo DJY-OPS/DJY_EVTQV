@@ -55,7 +55,6 @@
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
-extern CAN_HandleTypeDef hcan1;
 extern TIM_HandleTypeDef htim6;
 /* USER CODE BEGIN EV */
 
@@ -200,14 +199,6 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /**
-  * @brief This function handles CAN1 RX0 interrupt.
-  */
-void CAN1_RX0_IRQHandler(void)
-{
-  HAL_CAN_IRQHandler(&hcan1);
-}
-
-/**
   * @brief This function handles TIM6 global interrupt and DAC1, DAC2 underrun error interrupts.
   */
 void TIM6_DAC_IRQHandler(void)
@@ -222,5 +213,13 @@ void TIM6_DAC_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+void USART2_IRQHandler(void) {
+    extern UART_HandleTypeDef huart2;
+    HAL_UART_IRQHandler(&huart2);
+}
+void CAN1_RX0_IRQHandler(void) {
+    extern CAN_HandleTypeDef hcan1;
+    HAL_CAN_IRQHandler(&hcan1);
+}
 
 /* USER CODE END 1 */
