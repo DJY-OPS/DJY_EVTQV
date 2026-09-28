@@ -16,3 +16,8 @@ __pycache__/
 *.pyc
 *.exe
 
+# Archives
+*.zip
+
+# Local editor & tools
+.claude/

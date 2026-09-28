@@ -40,7 +40,6 @@
 #include "vehicle_clock.h"
 #include "board_time_sync.h"
 #include "timing_diag.h"
-#include "djy_telemetry_protocol.h"
 #include <string.h>
 #include <stdio.h>
 /* USER CODE END Includes */
@@ -83,6 +82,9 @@
  *     켜면 main()이 DAC_SelfTest()에서 리턴하지 않는다.
  * 0 = 평소. 반드시 0으로 두고 차에 올릴 것. */
 #define DAC_SELFTEST_MODE 0
+
+/* ★★ SAS 미장착 모드는 vehicle_params.h 의 SAS_BYPASS_MODE 에 있다 ★★
+ * (main.c와 safety_monitor.c가 같은 값을 봐야 해서 공용 헤더에 둔다) */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -114,7 +116,6 @@ IWDG_HandleTypeDef hiwdg;
 /* USER CODE BEGIN PV */
 static TV_t tv;
 static volatile bool s_dbg_print_flag = false;   /* USART2로 RPM 출력 트리거 */
-static volatile uint32_t s_telemetry_sequence = 0; /* Includes skipped 100 Hz requests. */
 
 /* 입력 필터 상태 (100Hz 제어 ISR 전용 — 다른 컨텍스트에서 건드리지 말 것) */
 static Deglitch_t s_tps_dg,  s_sas_dg;
@@ -155,7 +156,7 @@ static void MX_IWDG_Init(void);
 static float SAS_to_SteeringAngle(float raw);
 static float TPS_to_Fraction(float raw);
 static void  TPS_LearnIdle(uint32_t duration_ms);
-static void  Telemetry_Publish(uint32_t sequence);
+static void  Telemetry_Publish(void);
 
 /* USER CODE END PFP */
 
@@ -302,12 +303,8 @@ int main(void)
 	     BoardTimeSync_Poll();
 	     SD_Logger_Flush();   /* SD 기록 */
 	     if (s_dbg_print_flag) {
-	         uint32_t mask = __get_PRIMASK();
-	         __disable_irq();
-	         uint32_t sequence = s_telemetry_sequence;
 	         s_dbg_print_flag = false;
-	         __set_PRIMASK(mask);
-	         Telemetry_Publish(sequence);
+	         Telemetry_Publish();
 	     }
 	     Timing_Publish(); /* Service diagnostics after async status TX completes. */
 	     /* ★IWDG 갱신 — 제어 ISR이 플래그를 세웠을 때만. 여기까지 왔다는 건
@@ -627,7 +624,7 @@ static void MX_TIM6_Init(void)
   */
 /**
   * @brief USART1 Initialization Function — ESP32 전용 링크
-  * PA9=TX / PA10=RX (CN5-1 / CN9-3), DJY_TELEMETRY_BAUD (460800) 8N1.
+  * PA9=TX / PA10=RX (CN5-1 / CN9-3), 115200 8N1.
   * ESP32가 10Hz로 9바이트 TV 강도 명령(djy_uart_protocol.h)을 보내온다.
   * 수신은 바이트 단위 인터럽트(esp_link.c) — DMA는 IMU가 이미 쓰고 있어 안 겹친다.
   * @retval None
@@ -635,7 +632,7 @@ static void MX_TIM6_Init(void)
 static void MX_USART1_UART_Init(void)
 {
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = DJY_TELEMETRY_BAUD;
+  huart1.Init.BaudRate = 115200;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
@@ -793,9 +790,15 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 static float SAS_to_SteeringAngle(float raw) {
+#if SAS_BYPASS_MODE
+    /* ★SAS 미장착 — 조향각 0 고정. raw는 쓰지 않는다(미사용 경고 방지). */
+    (void)raw;
+    return 0.0f;
+#else
     float a = (raw - (float)SAS_CENTER_RAW) * SAS_RAW_TO_RAD
               * SAS_TO_STEERING_RATIO;
     return CLAMP(a, -MAX_STEERING_ANGLE_RAD, MAX_STEERING_ANGLE_RAD);
+#endif
 }
 
 /* 페달 유격(데드밴드)과 끝단 여유를 반영한 매핑.
@@ -850,17 +853,14 @@ static void TPS_LearnIdle(uint32_t duration_ms) {
  * CAN을 보내고 있어서 추가 프레임 없이 바이트 하나만 실으면 된다.
  * Board B는 CAN_IsTVSwitchOn()으로 읽는다. */
 
-/* 100 Hz main-loop snapshots on UART1; USB ASCII remains at most 5 Hz.
- * UART1 owns frame until READY. USB owns line independently. Neither blocks
- * control; CRC, packing, formatting and TX run with interrupts enabled. */
-static void Telemetry_Publish(uint32_t sequence) {
-    static uint8_t frame[DJY_TELEMETRY_SIZE];
-    static char line[768];
-    static uint32_t sent_count;
-    static uint64_t usb_last_us;
-    static bool usb_sent;
+/* 메인 루프에서 200ms마다 호출 — USART2(ST-Link 가상COM, 115200 8N1)로 출력.
+ * 정수(uint16_t)만 찍으므로 nano.specs의 printf 부동소수점 미지원과 무관하다. */
+/* Same bounded sentence on ESP UART1 and ST-Link USB UART2. Control remains
+ * in TIM6; never mask interrupts while formatting or transmitting. */
+static void Telemetry_Publish(void) {
+    static char line[768]; /* UART1 IT owns this until gState becomes READY. */
+    static char usb_line[768]; /* Keep the existing USB sentence length unchanged. */
     if (huart1.gState != HAL_UART_STATE_READY) return;
-    DjyTelemetry packet = {0};
     uint32_t mask = __get_PRIMASK();
     __disable_irq();
     TV_t t = tv;
@@ -880,52 +880,7 @@ static void Telemetry_Publish(uint32_t sequence) {
     dac_r = (unsigned)DAC->DOR2;
 #endif
     float yaw = IMU_GetYawRate(), lat = IMU_GetLateralAcc();
-    packet.sequence = sequence;
-    packet.snapshot_us = VehicleClock_NowUs();
-    packet.tx_skipped = sequence - sent_count - 1u;
-    packet.rpm_left = (uint16_t)rpm_l; packet.rpm_right = (uint16_t)rpm_r;
-    packet.tps_raw = s.tps_raw; packet.tps_idle = s_tps_idle;
-    packet.sas_raw = s.sas_angle; packet.sas_center = SAS_CENTER_RAW;
-    packet.dac_left = (uint16_t)dac_l; packet.dac_right = (uint16_t)dac_r;
-    packet.traction_milli = (uint16_t)(t.traction_scale * 1000.0f);
-    packet.tps_pct = (uint8_t)(TPS_to_Fraction((float)s.tps_raw) * 100.0f);
-    packet.flags = (imu_valid ? DJY_TM_IMU_VALID : 0u) |
-        (sas_valid ? DJY_TM_SAS_VALID : 0u) |
-        (left_valid ? DJY_TM_RPM_LEFT_VALID : 0u) |
-        (right_valid ? DJY_TM_RPM_RIGHT_VALID : 0u) |
-        (fresh ? DJY_TM_CONTROL_FRESH : 0u) |
-        (t.tv_active ? DJY_TM_TV_ACTIVE : 0u) | (t.ed_active ? DJY_TM_ED_ACTIVE : 0u);
-    packet.fault = (uint8_t)fault; packet.command_sequence = live.sequence;
-    packet.requested = fresh ? live.strength_percent : (uint8_t)applied;
-    packet.limit = fresh ? live.limit_percent : 100u; packet.applied = (uint8_t)applied;
-    packet.yaw_milli = (int32_t)(yaw * 1000.0f);
-    packet.lat_milli = (int32_t)(lat * 1000.0f);
-    packet.ax_milli = (int32_t)(IMU_GetAccelerationX() * 1000.0f);
-    packet.ay_milli = (int32_t)(IMU_GetAccelerationY() * 1000.0f);
-    packet.az_milli = (int32_t)(IMU_GetAccelerationZ() * 1000.0f);
-    packet.speed_milli = (int32_t)(t.vehicle_speed * 1000.0f);
-    packet.desired_yaw_milli = (int32_t)(t.desired_yaw * 1000.0f);
-    packet.yaw_error_milli = (int32_t)(t.yaw_error * 1000.0f);
-    packet.delta_power_milli = (int32_t)(t.delta_power * 1000.0f);
-    packet.power_left_milli = (int32_t)(t.power_left * 1000.0f);
-    packet.power_right_milli = (int32_t)(t.power_right * 1000.0f);
-    packet.steer_milli = (int32_t)(SAS_to_SteeringAngle((float)s.sas_angle) * 1000.0f);
-    packet.kp_milli = (int32_t)(PID_KP * 1000.0f);
-    packet.ki_milli = (int32_t)(PID_KI * 1000.0f);
-    packet.kd_milli = (int32_t)(PID_KD * 1000.0f);
-    packet.capture_left = g_rpm_cap_count_l; packet.capture_right = g_rpm_cap_count_r;
-    packet.glitch_left = g_rpm_glitch_l; packet.glitch_right = g_rpm_glitch_r;
-    packet.command_rx = g_esp_rx_count; packet.command_errors = g_esp_crc_err + g_esp_uart_err;
-    packet.can_rx = g_can_rx_count; packet.can_errors = g_can_err_count;
-    packet.can_status = g_can_last_esr;
-    packet.imu_gyro_ok = g_imu_gyro_ok; packet.imu_pkt_bad = g_imu_pkt_bad;
-    packet.imu_resync = g_imu_resync; packet.imu_dma_restart = g_imu_dma_restart;
     __set_PRIMASK(mask);
-    packet.timing_valid = Timing_ReadRelay(packet.timing);
-    djy_telemetry_pack(frame, &packet);
-    if (HAL_UART_Transmit_IT(&huart1, frame, sizeof(frame)) == HAL_OK) ++sent_count;
-    if (huart2.gState != HAL_UART_STATE_READY) return;
-    if (usb_sent && packet.snapshot_us - usb_last_us < 200000u) return;
     int n = snprintf(line, sizeof(line),
         "L=%u R=%u cap=%lu/%lu glt=%lu/%lu tps=%u pct=%d idle=%u "
         "imu=%u sas=%u yaw=%ld lat=%ld lon=%ld ax=%ld ay=%ld az=%ld "
@@ -955,10 +910,19 @@ static void Telemetry_Publish(uint32_t sequence) {
         (unsigned long)g_imu_resync, (unsigned long)g_imu_dma_restart,
         (long)(PID_KP * 1000.0f), (long)(PID_KI * 1000.0f), (long)(PID_KD * 1000.0f));
     if (n <= 0 || (size_t)n >= sizeof(line)) return;
-    if (HAL_UART_Transmit_IT(&huart2, (uint8_t *)line, (uint16_t)n) == HAL_OK) {
-        usb_last_us = packet.snapshot_us;
-        usb_sent = true;
+    /* USART2 owns usb_line while an interrupt transfer is active. USB is an
+     * optional mirror; do not delay IMU parsing or overwrite an active TX. */
+    bool usb_ready=(huart2.gState==HAL_UART_STATE_READY);
+    if(usb_ready)memcpy(usb_line,line,(size_t)n);
+    int wire_n=n;
+    if(n>=2) {
+        int extra=Timing_FormatRelay(line+n-2,sizeof(line)-(size_t)n);
+        if(extra>0) {
+            wire_n=n-2+extra;line[wire_n++]='\r';line[wire_n++]='\n';
+        } else {line[n-2]='\r';line[n-1]='\n';}
     }
+    (void)HAL_UART_Transmit_IT(&huart1, (uint8_t *)line, (uint16_t)wire_n);
+    if(usb_ready)(void)HAL_UART_Transmit_IT(&huart2, (uint8_t *)usb_line, (uint16_t)n);
 }
 
 /* 100Hz 실시간 제어 루프 */
@@ -971,6 +935,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
      * HAL_IWDG_Refresh()를 부르면 메인 루프가 멎어도 워치독이 계속 먹여져서
      * 아무것도 못 잡는다. */
     s_ctrl_isr_alive = true;
+
+    /* 0. 디버그 출력 트리거 — 100Hz/20 = 5Hz(200ms 간격) */
+    static uint8_t dbg_div = 0;
+    if (++dbg_div >= 20) { dbg_div = 0; s_dbg_print_flag = true; }
 
     /* 1. 토글 스위치 — ★Board A로 이전됨(PC13 → 앞 보드 PC13 → CAN 0x100 바이트4).
      *    스위치가 조종석에 있어 앞 보드에서 읽는 게 배선상 짧다. 디바운스는
@@ -1067,10 +1035,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
     /* 6. 로깅 */
     SD_Logger_Write(&tv, action);
-    /* One telemetry request per completed control tick. A stalled/busy main
-     * loop is visible as a source sequence gap, never a fabricated sample. */
-    ++s_telemetry_sequence;
-    s_dbg_print_flag = true;
     Timing_ControlEnd(timing_start);
 }
 
