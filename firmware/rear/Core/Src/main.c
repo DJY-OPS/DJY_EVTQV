@@ -83,6 +83,9 @@
  *     켜면 main()이 DAC_SelfTest()에서 리턴하지 않는다.
  * 0 = 평소. 반드시 0으로 두고 차에 올릴 것. */
 #define DAC_SELFTEST_MODE 0
+
+/* ★★ SAS 미장착 모드는 vehicle_params.h 의 SAS_BYPASS_MODE 에 있다 ★★
+ * (main.c와 safety_monitor.c가 같은 값을 봐야 해서 공용 헤더에 둔다) */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -793,9 +796,15 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 static float SAS_to_SteeringAngle(float raw) {
+#if SAS_BYPASS_MODE
+    /* ★SAS 미장착 — 조향각 0 고정. raw는 쓰지 않는다(미사용 경고 방지). */
+    (void)raw;
+    return 0.0f;
+#else
     float a = (raw - (float)SAS_CENTER_RAW) * SAS_RAW_TO_RAD
               * SAS_TO_STEERING_RATIO;
     return CLAMP(a, -MAX_STEERING_ANGLE_RAD, MAX_STEERING_ANGLE_RAD);
+#endif
 }
 
 /* 페달 유격(데드밴드)과 끝단 여유를 반영한 매핑.
@@ -1044,8 +1053,15 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
          *   NONE         : TV 허용(스위치 ON일 때). ED는 TV_Update()가 알아서 뺀다.
          *   DISABLE_TV   : IMU/RPM 문제 → TV만 끄고 ED로 폴백 (ED는 IMU 불필요)
          *   DISABLE_DIFF : SAS 문제 → 조향각을 못 믿으므로 차동 자체를 포기, 50:50
-         * ED 자체를 켜고 끄는 조건은 "조향각을 믿을 수 있는가" 하나뿐이다. */
-        TV_SetTVEnabled(sw_on && (action == SAFE_ACTION_NONE));
+         * ED 자체를 켜고 끄는 조건은 "조향각을 믿을 수 있는가" 하나뿐이다.
+         *
+         * ★IMU_IsCalibrated() — 자이로 영점이 없으면 TV를 허용하지 않는다.
+         *   (1) 부팅 캘리브레이션 FAIL(차가 움직였거나 바이어스 이상치)
+         *   (2) IWDG 리셋 후 부팅(캘리브레이션을 일부러 건너뜀)
+         *   두 경우 모두 바이어스 0으로 동작해서, 정지 상태의 자이로 오프셋이
+         *   그대로 요레이트 오차가 된다. 예전엔 (2)에서 부팅 때 TV를 한 번 껐지만
+         *   이 줄이 매 틱 다시 켜서 무효였다. ED는 IMU를 안 쓰므로 그대로 동작한다. */
+        TV_SetTVEnabled(sw_on && (action == SAFE_ACTION_NONE) && IMU_IsCalibrated());
         TV_SetEDEnabled(action != SAFE_ACTION_DISABLE_DIFF);
 
         TV_Update(&tv);

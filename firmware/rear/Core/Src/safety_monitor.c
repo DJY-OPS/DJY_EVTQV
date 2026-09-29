@@ -52,10 +52,12 @@ void Safety_Update(void) {
      *    TV의 목표요레이트도 엉터리가 되므로 차동 자체를 포기해야 한다.
      *    하트비트가 끊겼으면(=비트값이 오래된 값이면) 판단 근거가 없으므로
      *    이 검사는 건너뛴다 — Board A가 통째로 죽은 경우는 위 1)이 잡는다. */
+#if !SAS_BYPASS_MODE
     if (CAN_IsHeartbeatFresh() &&
         (CAN_GetHeartbeatStatus() & HB_STATUS_SAS_ERR)) {
         s_fault = FAULT_SAS_ERROR; s_action = SAFE_ACTION_DISABLE_DIFF; return;
     }
+#endif
 
     /* 4) IMU 무효/이상치 → TV만 비활성. ED는 IMU를 안 쓰므로 계속 동작한다. */
     if (!IMU_IsValid()) {
