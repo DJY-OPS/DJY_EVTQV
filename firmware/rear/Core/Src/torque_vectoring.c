@@ -131,10 +131,19 @@ void TV_Update(TV_t *tv) {
 
     float dP_raw = 0.0f;
 
+    /* ★목표 요레이트와 오차는 TV 활성 여부와 무관하게 항상 계산해서 기록한다.
+     * 제어에 쓰는 건 tv_active일 때뿐이지만(PID는 아래 분기 안에서만 호출),
+     * 언더스티어 그래디언트(Kus) 실측은 반드시 TV가 꺼진 구간에서 해야 하기
+     * 때문이다 — TV가 켜져 있으면 요레이트를 목표로 밀어붙이므로 "목표 대비
+     * 실측" 관계가 순환 참조가 되어 Kus를 뽑을 수 없다.
+     * 예전에는 else 분기에서 둘 다 0으로 덮어써서, 정작 필요한 TV OFF 구간의
+     * 로그가 전부 0이었다(2026-09 주행 로그에서 확인). */
+    float psi_ref   = desired_yaw_rate(v, delta);
+    tv->desired_yaw = psi_ref;
+    tv->yaw_error   = psi_ref - tv->imu_yaw_rate;
+
     if (tv_active) {
-        float psi_ref = desired_yaw_rate(v, delta);
-        float err     = psi_ref - tv->imu_yaw_rate;
-        dP_raw        = PID_Update(&s_pid, err, CONTROL_DT);  /* [kW], 제로섬 차동 */
+        dP_raw = PID_Update(&s_pid, tv->yaw_error, CONTROL_DT);  /* [kW], 제로섬 차동 */
 
         /* 횡G 불일치(트랙션 상실) 감지되면 개입을 줄인다 */
         float tscale = traction_scale(v, tv->imu_yaw_rate,
@@ -145,8 +154,6 @@ void TV_Update(TV_t *tv) {
         float lim = delta_power_limit(v, P_demand);
         dP_raw = CLAMP(dP_raw, -lim, lim);
 
-        tv->desired_yaw    = psi_ref;
-        tv->yaw_error      = err;
         tv->traction_scale = tscale;
 
         /* TV 개입 중에도 ED 필터를 0으로 계속 굴려준다 → ED로 되돌아오는
@@ -154,8 +161,6 @@ void TV_Update(TV_t *tv) {
         (void)ED_ComputeDeltaPower(delta, 0.0f, v);
     } else {
         PID_Reset(&s_pid);
-        tv->desired_yaw    = 0.0f;
-        tv->yaw_error      = 0.0f;
         tv->traction_scale = 1.0f;
 
         /* 페달 해제/차동 금지 뒤에 이전 ED 필터값을 재사용하지 않는다. */

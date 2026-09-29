@@ -99,8 +99,10 @@ void DAC_SetSafeState(void) {
 void DAC_SelfTest(void) {
     extern UART_HandleTypeDef huart2;
     /* 목표 전압으로 지정한다 — 코드 환산은 백엔드에 따라 자동으로 달라진다.
-     * 0V / 0.9V(off) / 1.5V / 2.0V / 3.0V(7kW 상당) */
-    static const float volts[] = { 0.0f, 0.9f, 1.5f, 2.0f, 3.0f };
+     * 0V / 0.9V(off) / 1.5V / 2.5V / 3.5V / 4.0V(=V_CTRL_FULL_MV, 7kW 상당)
+     * ★4.0V 단계는 VDD=5V일 때만 제대로 나온다. VDD를 3.3V로 구동하는
+     *   구성(아이솔레이터 없이 STM32 SPI 직결)에서는 3.3V 근처에서 잘린다. */
+    static const float volts[] = { 0.0f, 0.9f, 1.5f, 2.5f, 3.5f, 4.0f };
     char line[112];
 
 #if DAC_USE_INTERNAL
