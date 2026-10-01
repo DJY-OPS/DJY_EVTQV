@@ -34,6 +34,7 @@
 #include "esp_link.h"
 #include "esp_link_config.h"
 #include "pit_tuning.h"
+#include "sas_center.h"
 #include "control_settings.h"
 #include "electronic_diff.h"
 #include "safety_monitor.h"
@@ -288,6 +289,17 @@ int main(void)
        if (n > 0) HAL_UART_Transmit(&huart2, (uint8_t *)msg, (uint16_t)n, 50);
    }
 
+   /* ★SAS 영점: 플래시에 저장된 마지막 직진 영점을 읽는다. 저장 섹터가 가득
+    * 찼으면 여기서 지우므로(1~2초) 반드시 워치독·제어 루프 시작 전이어야 한다. */
+   SasCenter_Init();
+   {
+       char msg[72];
+       static const char *src_name[] = { "default", "flash", "straight" };
+       int n = snprintf(msg, sizeof(msg), "SAS center: %u (%s)\r\n",
+                        (unsigned)SasCenter_GetRaw(), src_name[SasCenter_GetSource()]);
+       if (n > 0) HAL_UART_Transmit(&huart2, (uint8_t *)msg, (uint16_t)n, 50);
+   }
+
    /* ★워치독은 여기서 시작한다 — IMU_Calibrate(1초)/TPS_LearnIdle(300ms) 같은
     * 긴 블로킹 초기화가 모두 끝난 뒤여야 한다. 초기화 중에 켜면 부팅이
     * 리셋 루프에 빠진다. IWDG는 한 번 켜면 끌 수 없다. */
@@ -318,6 +330,8 @@ int main(void)
 	     }
          (void)PitStatus_Publish();
 	     Timing_Publish(); /* Service diagnostics after async status TX completes. */
+	     /* 정지 2초 후 학습된 SAS 영점을 플래시에 이어 쓴다 (주행 중에는 안 씀). */
+	     SasCenter_Service(RPM_GetLeft() < 5u && RPM_GetRight() < 5u);
 	     /* ★IWDG 갱신 — 제어 ISR이 플래그를 세웠을 때만. 여기까지 왔다는 건
 	      * 메인 루프가 살아있다는 뜻이고, 플래그가 서 있다는 건 제어 ISR도
 	      * 살아있다는 뜻이다. 둘 다 확인돼야 갱신한다(PV 블록 주석 참고). */
@@ -806,7 +820,7 @@ static float SAS_to_SteeringAngle(float raw) {
     (void)raw;
     return 0.0f;
 #else
-    float a = (raw - (float)SAS_CENTER_RAW) * SAS_RAW_TO_RAD
+    float a = SasCenter_Offset(raw) * SAS_RAW_TO_RAD
               * SAS_TO_STEERING_RATIO;
     return CLAMP(a, -MAX_STEERING_ANGLE_RAD, MAX_STEERING_ANGLE_RAD);
 #endif
@@ -940,7 +954,7 @@ static void Telemetry_Publish(uint32_t sequence) {
     packet.tx_skipped = sequence - sent_count - 1u;
     packet.rpm_left = (uint16_t)rpm_l; packet.rpm_right = (uint16_t)rpm_r;
     packet.tps_raw = s.tps_raw; packet.tps_idle = tps_idle;
-    packet.sas_raw = s.sas_angle; packet.sas_center = SAS_CENTER_RAW;
+    packet.sas_raw = s.sas_angle; packet.sas_center = SasCenter_GetRaw();
     packet.dac_left = (uint16_t)dac_l; packet.dac_right = (uint16_t)dac_r;
     packet.traction_milli = (uint16_t)(t.traction_scale * 1000.0f);
     packet.tps_pct = (uint8_t)(TPS_to_Fraction((float)s.tps_raw) * 100.0f);
@@ -996,7 +1010,7 @@ static void Telemetry_Publish(uint32_t sequence) {
         (unsigned long)g_esp_rx_count, (unsigned long)(g_esp_crc_err + g_esp_uart_err),
         (unsigned)left_valid, (unsigned)right_valid,
         (long)(SAS_to_SteeringAngle((float)s.sas_angle) * 1000.0f),
-        (unsigned)sas_valid, (unsigned)SAS_CENTER_RAW,
+        (unsigned)sas_valid, (unsigned)SasCenter_GetRaw(),
         (unsigned long)g_can_rx_count, (unsigned long)g_can_err_count, (unsigned long)g_can_last_esr,
         (unsigned long)g_imu_gyro_ok, (unsigned long)g_imu_pkt_bad,
         (unsigned long)g_imu_resync, (unsigned long)g_imu_dma_restart,
@@ -1058,7 +1072,7 @@ static void Telemetry_Publish(uint32_t sequence) {
         (unsigned long)g_esp_rx_count, (unsigned long)(g_esp_crc_err + g_esp_uart_err),
         (unsigned)left_valid, (unsigned)right_valid,
         (long)(SAS_to_SteeringAngle((float)s.sas_angle) * 1000.0f),
-        (unsigned)sas_valid, (unsigned)SAS_CENTER_RAW,
+        (unsigned)sas_valid, (unsigned)SasCenter_GetRaw(),
         (unsigned long)g_can_rx_count, (unsigned long)g_can_err_count, (unsigned long)g_can_last_esr,
         (unsigned long)g_imu_gyro_ok, (unsigned long)g_imu_pkt_bad,
         (unsigned long)g_imu_resync, (unsigned long)g_imu_dma_restart,
@@ -1160,7 +1174,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
          * Deglitch는 정상 구간에서 지연 0(입력을 그대로 통과)이고, 물리적으로
          * 불가능한 점프만 최대 2틱 무시한다. 그 뒤 1차 IIR로 잔여 노이즈 제거.
          * SAS 6.4ms / TPS 10.6ms 군지연 — 100Hz 루프에서 체감되지 않는 수준. */
-        float sas_f = Deglitch_Update(&s_sas_dg, (float)s.sas_angle,
+        /* 14비트 원시값이 0↔16383을 넘어가도 필터가 튀지 않게, 현재 영점 기준으로 펼친 값을 넣는다 */
+        float sas_f = Deglitch_Update(&s_sas_dg, SasCenter_Unwrap((float)s.sas_angle),
                                       SAS_MAX_STEP_RAW, DEGLITCH_MAX_REJECT);
         sas_f = LPF1_Update(&s_sas_lpf, sas_f, LPF1_Alpha(SAS_LPF_FC_HZ, CONTROL_DT));
 
@@ -1192,12 +1207,24 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
          *   두 경우 모두 바이어스 0으로 동작해서, 정지 상태의 자이로 오프셋이
          *   그대로 요레이트 오차가 된다. 예전엔 (2)에서 부팅 때 TV를 한 번 껐지만
          *   이 줄이 매 틱 다시 켜서 무효였다. ED는 IMU를 안 쓰므로 그대로 동작한다. */
-        TV_SetTVEnabled(sw_on && (action == SAFE_ACTION_NONE) && IMU_IsCalibrated());
+        /* ★SAS 영점이 공칭에서 8.7° 넘게 벗어났다 = 커플링이 크게 미끄러짐 → TV 금지, ED만 */
+        TV_SetTVEnabled(sw_on && (action == SAFE_ACTION_NONE) && IMU_IsCalibrated() &&
+                        SasCenter_GetLevel() < SAS_CENTER_LEVEL_ALARM);
         TV_SetEDEnabled(action != SAFE_ACTION_DISABLE_DIFF);
 
         TV_Update(&tv);
         DAC_SetLeftThrottle(tv.dac_left);
         DAC_SetRightThrottle(tv.dac_right);
+
+        /* SAS 직진 영점 학습 — 차속은 방금 TV_Update()가 계산한 값 */
+        {
+            bool learn_ok = (action == SAFE_ACTION_NONE) &&
+                CAN_IsSensorFresh() && CAN_IsHeartbeatFresh() &&
+                !(CAN_GetHeartbeatStatus() & HB_STATUS_SAS_ERR) &&
+                IMU_IsValid() && IMU_IsCalibrated();
+            SasCenter_Update(s.sas_angle, tv.vehicle_speed, IMU_GetYawRate(),
+                             IMU_GetLateralAcc(), RPM_GetLeft(), RPM_GetRight(), learn_ok);
+        }
     }
 
     /* 5. 상태 LED — 정상 점멸 2.5Hz / TV 개입 중 10Hz / 폴트 시 소등 */
