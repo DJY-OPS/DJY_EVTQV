@@ -19,7 +19,7 @@
  *   11T → 4.727 / 10T → 5.200 / 9T → 5.778  (2026-10-01 9T·10T 시험 예정)
  *   실제 장착된 스프로킷과 다르면 차속·목표 요레이트·ΔF 한계가 그 비율만큼 틀어진다. */
 #define SPROCKET_REAR_TEETH   52
-#define SPROCKET_FRONT_TEETH  9   /* 2026-10-01 9T 장착 (이전 11T) */
+#define SPROCKET_FRONT_TEETH  10  /* 2026-10-01 10T 장착 (9T는 장착 불가, 이전 11T) */
 #define GEAR_RATIO_DEFAULT  ((float)SPROCKET_REAR_TEETH / (float)SPROCKET_FRONT_TEETH)
 
 /* ── 출력 예산 (kW 도메인) ── */
@@ -215,7 +215,7 @@
 #define SAS_TO_STEERING_RATIO   -0.382f /* ★실측★ SAS raw→조향각[rad]. 부호 음수인 이유:
                                         * 센서는 우회전 시 raw 증가하지만, Ackermann 공식/
                                         * IMU(+좌회전) 관례상 delta는 좌회전이 양수여야 함 */
-#define SAS_CENTER_RAW          7603   /* 2026-10-01 원선회 주행 회귀(36구간, R2 0.991): 직진(yaw=0)에서
+#define SAS_CENTER_RAW          6480   /* 2026-10-01 원선회 주행 회귀(36구간, R2 0.991): 직진(yaw=0)에서
                                          * 10433 기준 −1.97° → +235카운트. 스탠드 11130 / 바닥 정지 10433은
                                          * 조향 유격 때문에 흔들림 — 주행값이 기준. SAS 커플링 슬립 계속 점검 */
 #define SAS_RAW_TO_RAD          (2.0f * 3.14159265f / 16384.0f) /* raw 1LSB당 rad(센서 1회전 기준, 실측 보정) */
