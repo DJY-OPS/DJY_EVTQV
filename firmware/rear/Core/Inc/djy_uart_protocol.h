@@ -7,8 +7,8 @@
 /* Dedicated ESP32 <-> Rear STM32 UART link.
  *
  * The pit computer refreshes this command through the ESP32 at 10 Hz.  Rear
- * accepts it only while valid frames keep arriving; loss of the link therefore
- * ramps the differential strength back to zero through ControlSettings.
+ * accepts it only while valid frames keep arriving. The vehicle application
+ * selects the no-link fallback (TV_STRENGTH_NO_ESP).
  */
 #define DJY_UART_MAGIC_0          0xd5u
 #define DJY_UART_MAGIC_1          0x4au

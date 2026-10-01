@@ -14,6 +14,8 @@ void  TV_SetGearRatio(float r) { if (r > 0.1f) s_gear_ratio = r; }
 float TV_GetGearRatio(void)    { return s_gear_ratio; }
 //
 
+static DjyPitValues s_pit = {(uint32_t)(PID_KP*1000), (uint32_t)(PID_KI*1000),
+    (uint32_t)(PID_KD*1000),200u,(uint32_t)(DELTA_POWER_MAX_KW*1000),(uint32_t)(P_SUM_MAX_KW*1000)};
 static PID_State s_pid;
 static bool      s_tv_enabled = false;
 static bool      s_ed_enabled = true;    /* SAS가 멀쩡한 한 항상 켜둔다 */
@@ -26,7 +28,16 @@ static float     s_dp_prev    = 0.0f;    /* 슬루 리미터 상태 */
  *  없이도 주행하므로 기본값을 1.0으로 두고 vehicle_params.h에서 바꾸게 했다. */
 static float     s_strength   = TV_STRENGTH_NO_ESP;
 
+DjyPitValues TV_GetPitValues(void) { return s_pit; }
+void TV_ApplyPitValues(const DjyPitValues *values) {
+    s_pit=*values;
+    PID_Init(&s_pid,s_pit.kp*.001f,s_pit.ki*.001f,s_pit.kd*.001f,
+             s_pit.delta*.001f,s_pit.delta*.001f);
+    ED_Reset(); s_dp_prev=0.0f;
+}
 void TV_Init(void) {
+    s_pit=(DjyPitValues){(uint32_t)(PID_KP*1000), (uint32_t)(PID_KI*1000),
+        (uint32_t)(PID_KD*1000),200u,(uint32_t)(DELTA_POWER_MAX_KW*1000),(uint32_t)(P_SUM_MAX_KW*1000)};
     PID_Init(&s_pid, PID_KP, PID_KI, PID_KD, PID_INTEGRAL_MAX, PID_OUTPUT_MAX);
     ED_Init();
     s_tv_enabled = false;
@@ -90,7 +101,7 @@ static float traction_scale(float v, float yaw_rate_meas, float lat_acc_meas) {
 static float delta_power_limit(float v, float p_demand) {
     float by_force  = DELTA_FORCE_MAX_N * v * 0.001f;   /* N·m/s → kW */
     float by_demand = TV_DELTA_DEMAND_FRAC * p_demand;
-    return fminf(fminf(DELTA_POWER_MAX_KW, by_force), by_demand);
+    return fminf(fminf(s_pit.delta * 0.001f, by_force), by_demand);
 }
 
 /* kW → DAC 코드 (컨트롤러 전압 매핑의 정확한 역함수)
@@ -115,7 +126,7 @@ void TV_Update(TV_t *tv) {
     tv->vehicle_speed = v;
 
     /* 운전자 요구 총전력과 기준 분배 (제로섬의 기준점) */
-    float P_demand = CLAMP(tv->tps_fraction, 0.0f, 1.0f) * P_SUM_MAX_KW;
+    float P_demand = CLAMP(tv->tps_fraction, 0.0f, 1.0f) * (s_pit.budget * 0.001f);
     P_demand = fminf(P_demand, 2.0f * MOTOR_MAX_KW);
     float base     = 0.5f * P_demand;
 
@@ -185,7 +196,7 @@ void TV_Update(TV_t *tv) {
     float demand_limit = CLAMP(TV_DELTA_DEMAND_FRAC, 0.0f, 1.0f) * P_demand;
     float motor_limit = fmaxf(0.0f, 2.0f * MOTOR_MAX_KW - P_demand);
     float mode_limit = tv_active ? delta_power_limit(v, P_demand)
-                                : (ed_active ? ED_DELTA_MAX_KW : 0.0f);
+                                : (ed_active ? fminf(ED_DELTA_MAX_KW, s_pit.delta * 0.001f) : 0.0f);
     float final_limit = fmaxf(0.0f, fminf(fminf(demand_limit, motor_limit), mode_limit));
     dP = CLAMP(dP, -final_limit, final_limit);
 
@@ -202,8 +213,8 @@ void TV_Update(TV_t *tv) {
 
     /* 최종 안전 포화: 합이 예산 초과면 비례 축소 — 합 ≤ P_SUM_MAX 수학적 보장 */
     float sum = PL + PR;
-    if (sum > P_SUM_MAX_KW && sum > 0.0f) {
-        float k = P_SUM_MAX_KW / sum;
+    if (sum > (s_pit.budget * 0.001f) && sum > 0.0f) {
+        float k = (s_pit.budget * 0.001f) / sum;
         PL *= k; PR *= k;
     }
 

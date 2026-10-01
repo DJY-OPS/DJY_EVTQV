@@ -32,6 +32,8 @@
 #include "dac_output.h"
 #include "torque_vectoring.h"
 #include "esp_link.h"
+#include "esp_link_config.h"
+#include "pit_tuning.h"
 #include "control_settings.h"
 #include "electronic_diff.h"
 #include "safety_monitor.h"
@@ -159,6 +161,7 @@ static float SAS_to_SteeringAngle(float raw);
 static float TPS_to_Fraction(float raw);
 static void  TPS_LearnIdle(uint32_t duration_ms);
 static void  Telemetry_Publish(uint32_t sequence);
+static bool PitStatus_Publish(void);
 
 /* USER CODE END PFP */
 
@@ -234,7 +237,8 @@ int main(void)
 #endif
    SD_Logger_Init();
    Safety_Init();
-   TV_Init();          /* TV + ED(전자식 디퍼런셜) 동시 초기화 */
+   TV_Init();
+   PitTuning_Init();          /* TV + ED(전자식 디퍼런셜) 동시 초기화 */
    ControlSettings_Init();
    EspLink_Init(&huart1);   /* ESP32 → TV 강도 명령 (10Hz, 9바이트 CRC 프레임) */
    DAC_SetSafeState();
@@ -306,12 +310,13 @@ int main(void)
 	     SD_Logger_Flush();   /* SD 기록 */
 	     if (s_dbg_print_flag) {
 	         uint32_t mask = __get_PRIMASK();
-	         __disable_irq();
-	         uint32_t sequence = s_telemetry_sequence;
-	         s_dbg_print_flag = false;
-	         __set_PRIMASK(mask);
-	         Telemetry_Publish(sequence);
+             __disable_irq();
+             uint32_t sequence = s_telemetry_sequence;
+             s_dbg_print_flag = false;
+             __set_PRIMASK(mask);
+             Telemetry_Publish(sequence);
 	     }
+         (void)PitStatus_Publish();
 	     Timing_Publish(); /* Service diagnostics after async status TX completes. */
 	     /* ★IWDG 갱신 — 제어 ISR이 플래그를 세웠을 때만. 여기까지 왔다는 건
 	      * 메인 루프가 살아있다는 뜻이고, 플래그가 서 있다는 건 제어 ISR도
@@ -638,7 +643,7 @@ static void MX_TIM6_Init(void)
 static void MX_USART1_UART_Init(void)
 {
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = DJY_TELEMETRY_BAUD;
+  huart1.Init.BaudRate = ESP_LINK_BAUD;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
@@ -859,9 +864,36 @@ static void TPS_LearnIdle(uint32_t duration_ms) {
  * CAN을 보내고 있어서 추가 프레임 없이 바이트 하나만 실으면 된다.
  * Board B는 CAN_IsTVSwitchOn()으로 읽는다. */
 
-/* 100 Hz main-loop snapshots on UART1; USB ASCII remains at most 5 Hz.
- * UART1 owns frame until READY. USB owns line independently. Neither blocks
- * control; CRC, packing, formatting and TX run with interrupts enabled. */
+/* 메인 루프에서 200ms마다 호출 — USART2(ST-Link 가상COM, 115200 8N1)로 출력.
+ * 정수(uint16_t)만 찍으므로 nano.specs의 printf 부동소수점 미지원과 무관하다. */
+/* Binary ESP: up to 100 Hz at 460800 baud. Legacy ASCII ESP: 5 Hz at
+ * 115200 baud. USB diagnostics remain ASCII/115200 in both configurations.
+ * Static TX buffers remain owned by HAL until that UART becomes READY. */
+static bool PitStatus_Publish(void) {
+    static uint32_t previous;
+    static uint8_t wire[DJY_PIT_SIZE];
+    static char ascii[192];
+    uint32_t now=HAL_GetTick();
+    if(now-previous<200u || huart1.gState!=HAL_UART_STATE_READY) return false;
+    DjyPitPacket p=PitTuning_Status();
+#if ESP_LINK_BINARY_TELEMETRY
+    djy_pit_pack(wire,DJY_PIT_STATUS,&p);
+    HAL_StatusTypeDef sent=HAL_UART_Transmit_IT(&huart1,wire,sizeof(wire));
+    (void)ascii;
+#else
+    int n=snprintf(ascii,sizeof(ascii),"#PIT 2 %lu %lu %u %u %lu %lu %lu %lu %lu %lu\r\n",
+        (unsigned long)p.request_id,(unsigned long)p.revision,p.status,p.allowed,
+        (unsigned long)p.values.kp,(unsigned long)p.values.ki,(unsigned long)p.values.kd,
+        (unsigned long)p.values.ramp,(unsigned long)p.values.delta,(unsigned long)p.values.budget);
+    if(n<=0 || n>=(int)sizeof(ascii)) return false;
+    HAL_StatusTypeDef sent=HAL_UART_Transmit_IT(&huart1,(uint8_t*)ascii,(uint16_t)n);
+    (void)wire;
+#endif
+    if(sent==HAL_OK) previous=now;
+    return sent==HAL_OK;
+}
+
+#if ESP_LINK_BINARY_TELEMETRY
 static void Telemetry_Publish(uint32_t sequence) {
     static uint8_t frame[DJY_TELEMETRY_SIZE];
     static char line[768];
@@ -873,6 +905,7 @@ static void Telemetry_Publish(uint32_t sequence) {
     uint32_t mask = __get_PRIMASK();
     __disable_irq();
     TV_t t = tv;
+    DjyPitValues gains = TV_GetPitValues();
     SensorData_t s = CAN_GetSensorData();
     DjyUartLiveTv live = {0};
     bool fresh = EspLink_GetLiveTv(&live);
@@ -889,11 +922,24 @@ static void Telemetry_Publish(uint32_t sequence) {
     dac_r = (unsigned)DAC->DOR2;
 #endif
     float yaw = IMU_GetYawRate(), lat = IMU_GetLateralAcc();
-    packet.sequence = sequence;
+    float ax = IMU_GetAccelerationX(), ay = IMU_GetAccelerationY();
+    float az = IMU_GetAccelerationZ();
+    uint16_t tps_idle = s_tps_idle;
     packet.snapshot_us = VehicleClock_NowUs();
+    packet.capture_left = g_rpm_cap_count_l; packet.capture_right = g_rpm_cap_count_r;
+    packet.glitch_left = g_rpm_glitch_l; packet.glitch_right = g_rpm_glitch_r;
+    packet.command_rx = g_esp_rx_count; packet.command_errors = g_esp_crc_err + g_esp_uart_err;
+    packet.can_rx = g_can_rx_count; packet.can_errors = g_can_err_count;
+    packet.can_status = g_can_last_esr;
+    packet.imu_gyro_ok = g_imu_gyro_ok; packet.imu_pkt_bad = g_imu_pkt_bad;
+    packet.imu_resync = g_imu_resync; packet.imu_dma_restart = g_imu_dma_restart;
+    __set_PRIMASK(mask);
+    /* Scale and pack outside the critical section: command bytes arrive every
+     * 21.7 us at 460800 baud. Only the shared snapshot needs IRQ exclusion. */
+    packet.sequence = sequence;
     packet.tx_skipped = sequence - sent_count - 1u;
     packet.rpm_left = (uint16_t)rpm_l; packet.rpm_right = (uint16_t)rpm_r;
-    packet.tps_raw = s.tps_raw; packet.tps_idle = s_tps_idle;
+    packet.tps_raw = s.tps_raw; packet.tps_idle = tps_idle;
     packet.sas_raw = s.sas_angle; packet.sas_center = SAS_CENTER_RAW;
     packet.dac_left = (uint16_t)dac_l; packet.dac_right = (uint16_t)dac_r;
     packet.traction_milli = (uint16_t)(t.traction_scale * 1000.0f);
@@ -909,9 +955,9 @@ static void Telemetry_Publish(uint32_t sequence) {
     packet.limit = fresh ? live.limit_percent : 100u; packet.applied = (uint8_t)applied;
     packet.yaw_milli = (int32_t)(yaw * 1000.0f);
     packet.lat_milli = (int32_t)(lat * 1000.0f);
-    packet.ax_milli = (int32_t)(IMU_GetAccelerationX() * 1000.0f);
-    packet.ay_milli = (int32_t)(IMU_GetAccelerationY() * 1000.0f);
-    packet.az_milli = (int32_t)(IMU_GetAccelerationZ() * 1000.0f);
+    packet.ax_milli = (int32_t)(ax * 1000.0f);
+    packet.ay_milli = (int32_t)(ay * 1000.0f);
+    packet.az_milli = (int32_t)(az * 1000.0f);
     packet.speed_milli = (int32_t)(t.vehicle_speed * 1000.0f);
     packet.desired_yaw_milli = (int32_t)(t.desired_yaw * 1000.0f);
     packet.yaw_error_milli = (int32_t)(t.yaw_error * 1000.0f);
@@ -919,17 +965,9 @@ static void Telemetry_Publish(uint32_t sequence) {
     packet.power_left_milli = (int32_t)(t.power_left * 1000.0f);
     packet.power_right_milli = (int32_t)(t.power_right * 1000.0f);
     packet.steer_milli = (int32_t)(SAS_to_SteeringAngle((float)s.sas_angle) * 1000.0f);
-    packet.kp_milli = (int32_t)(PID_KP * 1000.0f);
-    packet.ki_milli = (int32_t)(PID_KI * 1000.0f);
-    packet.kd_milli = (int32_t)(PID_KD * 1000.0f);
-    packet.capture_left = g_rpm_cap_count_l; packet.capture_right = g_rpm_cap_count_r;
-    packet.glitch_left = g_rpm_glitch_l; packet.glitch_right = g_rpm_glitch_r;
-    packet.command_rx = g_esp_rx_count; packet.command_errors = g_esp_crc_err + g_esp_uart_err;
-    packet.can_rx = g_can_rx_count; packet.can_errors = g_can_err_count;
-    packet.can_status = g_can_last_esr;
-    packet.imu_gyro_ok = g_imu_gyro_ok; packet.imu_pkt_bad = g_imu_pkt_bad;
-    packet.imu_resync = g_imu_resync; packet.imu_dma_restart = g_imu_dma_restart;
-    __set_PRIMASK(mask);
+    packet.kp_milli = (int32_t)gains.kp;
+    packet.ki_milli = (int32_t)gains.ki;
+    packet.kd_milli = (int32_t)gains.kd;
     packet.timing_valid = Timing_ReadRelay(packet.timing);
     djy_telemetry_pack(frame, &packet);
     if (HAL_UART_Transmit_IT(&huart1, frame, sizeof(frame)) == HAL_OK) ++sent_count;
@@ -962,13 +1000,86 @@ static void Telemetry_Publish(uint32_t sequence) {
         (unsigned long)g_can_rx_count, (unsigned long)g_can_err_count, (unsigned long)g_can_last_esr,
         (unsigned long)g_imu_gyro_ok, (unsigned long)g_imu_pkt_bad,
         (unsigned long)g_imu_resync, (unsigned long)g_imu_dma_restart,
-        (long)(PID_KP * 1000.0f), (long)(PID_KI * 1000.0f), (long)(PID_KD * 1000.0f));
+        (long)gains.kp, (long)gains.ki, (long)gains.kd);
     if (n <= 0 || (size_t)n >= sizeof(line)) return;
     if (HAL_UART_Transmit_IT(&huart2, (uint8_t *)line, (uint16_t)n) == HAL_OK) {
         usb_last_us = packet.snapshot_us;
         usb_sent = true;
     }
 }
+
+#else
+static void Telemetry_Publish(uint32_t sequence) {
+    (void)sequence;
+    static char line[768]; /* UART1 IT owns this until gState becomes READY. */
+    static char usb_line[768]; /* Keep the existing USB sentence length unchanged. */
+    if (huart1.gState != HAL_UART_STATE_READY) return;
+    uint32_t mask = __get_PRIMASK();
+    __disable_irq();
+    TV_t t = tv;
+    DjyPitValues gains = TV_GetPitValues();
+    SensorData_t s = CAN_GetSensorData();
+    DjyUartLiveTv live = {0};
+    bool fresh = EspLink_GetLiveTv(&live);
+    bool sas_valid = CAN_IsSensorFresh() && CAN_IsHeartbeatFresh() &&
+                     !(CAN_GetHeartbeatStatus() & HB_STATUS_SAS_ERR);
+    bool imu_valid = IMU_IsTelemetryFresh();
+    bool left_valid = RPM_IsLeftFresh(), right_valid = RPM_IsRightFresh();
+    unsigned rpm_l = RPM_GetLeft(), rpm_r = RPM_GetRight();
+    unsigned applied = (unsigned)(TV_GetStrength() * 100.0f + 0.5f);
+    unsigned fault = (unsigned)Safety_GetFaultCode();
+    unsigned dac_l = t.dac_left, dac_r = t.dac_right;
+#if DAC_USE_INTERNAL
+    dac_l = (unsigned)DAC->DOR1;
+    dac_r = (unsigned)DAC->DOR2;
+#endif
+    float yaw = IMU_GetYawRate(), lat = IMU_GetLateralAcc();
+    __set_PRIMASK(mask);
+    int n = snprintf(line, sizeof(line),
+        "L=%u R=%u cap=%lu/%lu glt=%lu/%lu tps=%u pct=%d idle=%u "
+        "imu=%u sas=%u yaw=%ld lat=%ld lon=%ld ax=%ld ay=%ld az=%ld "
+        "vs=%ld dy=%ld ye=%ld dp=%ld pl=%ld pr=%ld tva=%u eda=%u tr=%ld "
+        "ctl=%u/%u req=%u lim=%u app=%u tv=%u ed=%u fault=%u dac=%u/%u sas=%u imu=%u urx=%lu uerr=%lu "
+        "rv=%u/%u steer=%ld sv=%u sc=%u can=%lu/%lu/%08lx idg=%lu/%lu/%lu/%lu "
+        "kp=%ld ki=%ld kd=%ld\r\n",
+        rpm_l, rpm_r, (unsigned long)g_rpm_cap_count_l, (unsigned long)g_rpm_cap_count_r,
+        (unsigned long)g_rpm_glitch_l, (unsigned long)g_rpm_glitch_r,
+        (unsigned)s.tps_raw, (int)(TPS_to_Fraction((float)s.tps_raw) * 100.0f), (unsigned)s_tps_idle,
+        (unsigned)imu_valid, (unsigned)s.sas_angle, (long)(yaw * 1000.0f), (long)(lat * 1000.0f),
+        (long)(IMU_GetAccelerationX() * 1000.0f), (long)(IMU_GetAccelerationX() * 1000.0f),
+        (long)(IMU_GetAccelerationY() * 1000.0f), (long)(IMU_GetAccelerationZ() * 1000.0f),
+        (long)(t.vehicle_speed * 1000.0f), (long)(t.desired_yaw * 1000.0f),
+        (long)(t.yaw_error * 1000.0f), (long)(t.delta_power * 1000.0f),
+        (long)(t.power_left * 1000.0f), (long)(t.power_right * 1000.0f),
+        (unsigned)t.tv_active, (unsigned)t.ed_active, (long)(t.traction_scale * 1000.0f),
+        (unsigned)fresh, (unsigned)live.sequence, fresh ? (unsigned)live.strength_percent : applied,
+        fresh ? (unsigned)live.limit_percent : 100u, applied, (unsigned)t.tv_active,
+        (unsigned)t.ed_active, fault, dac_l, dac_r, (unsigned)s.sas_angle, (unsigned)imu_valid,
+        (unsigned long)g_esp_rx_count, (unsigned long)(g_esp_crc_err + g_esp_uart_err),
+        (unsigned)left_valid, (unsigned)right_valid,
+        (long)(SAS_to_SteeringAngle((float)s.sas_angle) * 1000.0f),
+        (unsigned)sas_valid, (unsigned)SAS_CENTER_RAW,
+        (unsigned long)g_can_rx_count, (unsigned long)g_can_err_count, (unsigned long)g_can_last_esr,
+        (unsigned long)g_imu_gyro_ok, (unsigned long)g_imu_pkt_bad,
+        (unsigned long)g_imu_resync, (unsigned long)g_imu_dma_restart,
+        (long)gains.kp, (long)gains.ki, (long)gains.kd);
+    if (n <= 0 || (size_t)n >= sizeof(line)) return;
+    /* USART2 owns usb_line while an interrupt transfer is active. USB is an
+     * optional mirror; do not delay IMU parsing or overwrite an active TX. */
+    bool usb_ready=(huart2.gState==HAL_UART_STATE_READY);
+    if(usb_ready)memcpy(usb_line,line,(size_t)n);
+    int wire_n=n;
+    if(n>=2) {
+        int extra=Timing_FormatRelay(line+n-2,sizeof(line)-(size_t)n);
+        if(extra>0) {
+            wire_n=n-2+extra;line[wire_n++]='\r';line[wire_n++]='\n';
+        } else {line[n-2]='\r';line[n-1]='\n';}
+    }
+    (void)HAL_UART_Transmit_IT(&huart1, (uint8_t *)line, (uint16_t)wire_n);
+    if(usb_ready)(void)HAL_UART_Transmit_IT(&huart2, (uint8_t *)usb_line, (uint16_t)n);
+}
+
+#endif
 
 /* 100Hz 실시간 제어 루프 */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
@@ -980,6 +1091,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
      * HAL_IWDG_Refresh()를 부르면 메인 루프가 멎어도 워치독이 계속 먹여져서
      * 아무것도 못 잡는다. */
     s_ctrl_isr_alive = true;
+
+    /* 0. 디버그 출력 트리거 — 100Hz/20 = 5Hz(200ms 간격) */
+#if !ESP_LINK_BINARY_TELEMETRY
+    static uint8_t dbg_div = 0;
+    if (++dbg_div >= 20) { dbg_div = 0; s_dbg_print_flag = true; }
+#endif
 
     /* 1. 토글 스위치 — ★Board A로 이전됨(PC13 → 앞 보드 PC13 → CAN 0x100 바이트4).
      *    스위치가 조종석에 있어 앞 보드에서 읽는 게 배선상 짧다. 디바운스는
@@ -1007,6 +1124,20 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
      *    안전 판정이 IMU_IsValid()/RPM_IsFresh()를 보기 때문이다. */
     IMU_Update();
     RPM_Update();
+    /* Pit edits require TV switch OFF, released pedal and quiet wheel inputs for 1 s.
+     * Check again on the STM at the exact control boundary; the UI is not authority. */
+    {
+        static uint32_t cap_l,cap_r;
+        SensorData_t raw=CAN_GetSensorData();
+        bool stationary=CAN_IsSensorFresh() && CAN_IsHeartbeatFresh() && !sw_on &&
+            raw.tps_raw >= TPS_ADC_MIN-TPS_ADC_MARGIN &&
+            raw.tps_raw <= s_tps_idle+TPS_DEADBAND_RAW &&
+            RPM_GetLeft()<5u && RPM_GetRight()<5u &&
+            RPM_GetLeftRaw()==0u && RPM_GetRightRaw()==0u &&
+            cap_l==g_rpm_cap_count_l && cap_r==g_rpm_cap_count_r;
+        cap_l=g_rpm_cap_count_l; cap_r=g_rpm_cap_count_r;
+        PitTuning_Tick(stationary,HAL_GetTick());
+    }
 
     /* 3. 입력 수집 (RPM은 CAN이 아니라 TIM3 Input Capture 직접 측정) */
     SensorData_t s = CAN_GetSensorData();
@@ -1083,10 +1214,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
     /* 6. 로깅 */
     SD_Logger_Write(&tv, action);
-    /* One telemetry request per completed control tick. A stalled/busy main
-     * loop is visible as a source sequence gap, never a fabricated sample. */
+#if ESP_LINK_BINARY_TELEMETRY
     ++s_telemetry_sequence;
     s_dbg_print_flag = true;
+#endif
     Timing_ControlEnd(timing_start);
 }
 

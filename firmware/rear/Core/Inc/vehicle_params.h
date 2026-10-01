@@ -200,7 +200,7 @@
 #define SAS_TO_STEERING_RATIO   -0.46f  /* 조향비 조절인듯 ★실측★ SAS raw→조향각[rad]. 부호 음수인 이유:
                                         * 센서는 우회전 시 raw 증가하지만, Ackermann 공식/
                                         * IMU(+좌회전) 관례상 delta는 좌회전이 양수여야 함 */
-#define SAS_CENTER_RAW          11531   /* 2026-09-20 user straight-ahead: 52 valid samples, mean 6845.10, range 6842..6848 */
+#define SAS_CENTER_RAW          11531   /* Imported from STMNOWFIRM on 2026-09-29; previous 6845 calibration is historical. */
 #define SAS_RAW_TO_RAD          (2.0f * 3.14159265f / 16384.0f) /* raw 1LSB당 rad(센서 1회전 기준, 실측 보정) */
 /* ★2026-09 실측: 풀락에서 안쪽 30°, 바깥쪽 23° (좌선회 기준).
  * 자전거 모델 등가각은 단순 평균이 아니라 코탄젠트 평균이다 —

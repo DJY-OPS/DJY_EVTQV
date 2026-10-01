@@ -6,9 +6,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* A valid command must be refreshed by the ESP32.  Today's no-dial setup uses
- * this as the only TQV command source; expiry must therefore ramp to 0%. */
+/* Freshness of the last valid ESP command. Loss uses the vehicle's configured
+ * TV_STRENGTH_NO_ESP fallback in main.c; it does not change that policy here. */
 #define ESP_LINK_TIMEOUT_MS 500u
+#define ESP_LINK_FRAME_GAP_MS 50u
 
 void EspLink_Init(UART_HandleTypeDef *uart);
 bool EspLink_GetLiveTv(DjyUartLiveTv *command);

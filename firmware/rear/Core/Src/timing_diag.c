@@ -67,6 +67,28 @@ void Timing_ControlEnd(uint32_t started) {
     uint32_t duration=VehicleClock_Us32()-started;
     TimingStat_Add(&stats[EXEC],duration);if(duration>=10000u)overruns++;
 }
+int Timing_FormatRelay(char *destination,size_t capacity) {
+    static unsigned metric;
+    if(!measuring)return 0;
+    uint32_t mask=__get_PRIMASK();__disable_irq();
+    uint64_t clock=VehicleClock_NowUs();
+    BoardTimeSyncStatus sy=BoardTimeSync_Status((uint32_t)clock);
+    TimingStat stat=stats[metric];SensorTiming_t input=CAN_GetSensorTiming();
+    uint32_t seq=control_seq,fm=front_unmapped,fn=front_negative,ov=overruns;
+    __set_PRIMASK(mask);
+    // Versioned diagnostic extension, same field order as ESP RearTiming.
+    int n=snprintf(destination,capacity,
+      " ts=1/%lu/%u/%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu/%ld/%u/%u/%lu/%lu/%lu/%lu/%lu",
+      (unsigned long)seq,metric,(unsigned long)stat.n,
+      (unsigned long)(stat.n?stat.min:UINT32_MAX),
+      (unsigned long)(stat.n?stat.sum/stat.n:UINT32_MAX),
+      (unsigned long)TimingStat_P95(&stat),(unsigned long)(stat.n?stat.max:UINT32_MAX),
+      (unsigned long)sy.valid,(unsigned long)sy.rtt_us,(unsigned long)sy.bound_us,(long)sy.drift_ppm,
+      (unsigned)input.timestamped,(unsigned)input.span_us,(unsigned long)fm,(unsigned long)fn,
+      (unsigned long)ov,(unsigned long)(clock>>32),(unsigned long)clock);
+    if(n<=0 || (size_t)n>=capacity)return 0;
+    metric=(metric+1)%METRICS;return n;
+}
 bool Timing_ReadRelay(uint32_t fields[19]) {
     static unsigned metric;
     if(!measuring){memset(fields,0,19u*sizeof(*fields));return false;}

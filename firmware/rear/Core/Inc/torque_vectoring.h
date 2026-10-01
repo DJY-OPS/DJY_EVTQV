@@ -2,6 +2,7 @@
 #define TORQUE_VECTORING_H
 #include <stdint.h>
 #include <stdbool.h>
+#include "djy_pit_protocol.h"
 
 typedef struct {
     /* 입력 */
@@ -25,6 +26,8 @@ typedef struct {
 } TV_t;
 
 void TV_Init(void);
+void TV_ApplyPitValues(const DjyPitValues *values);
+DjyPitValues TV_GetPitValues(void);
 void TV_Update(TV_t *tv);
 void TV_Reset(void);            /* PID 적분·슬루·ED 필터 상태 전부 초기화 (STOP 진입 시) */
 

@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 void ControlSettings_Init(void);
+void ControlSettings_SetTvRamp(uint32_t percent_per_second);
 void ControlSettings_Update10ms(const DjyDriverControl *received, bool fresh);
 void ControlSettings_UpdateEsp10ms(uint8_t requested_percent,
                                    uint8_t limit_percent,

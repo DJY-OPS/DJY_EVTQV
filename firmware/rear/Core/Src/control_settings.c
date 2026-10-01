@@ -29,6 +29,10 @@ static void update_tv_slew(void) {
     }
 }
 
+void ControlSettings_SetTvRamp(uint32_t rate) {
+    s_tv_ramp_units=(uint8_t)(rate/10u);
+    s_tv_ramp_tenths=0u;
+}
 void ControlSettings_Init(void) {
     s_tv_target = 0u;
     s_tv_applied = 0u;

@@ -10,4 +10,5 @@ void Timing_ControlBegin(uint32_t now);
 void Timing_ControlEnd(uint32_t started);
 void Timing_Publish(void);
 bool Timing_ReadRelay(uint32_t fields[19]);
+int Timing_FormatRelay(char *destination,size_t capacity);
 #endif
