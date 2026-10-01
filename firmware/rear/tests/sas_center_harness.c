@@ -40,9 +40,17 @@ int main(void) {
     for (int i = 0; i < 400; ++i) tick(5000, 8.0f, 0.0f, 0.0f, 2000, 2000);
     printf("slip test: center %u level %u\n", SasCenter_GetRaw(), SasCenter_GetLevel());
     assert(SasCenter_GetLevel() == SAS_CENTER_LEVEL_ALARM && abs((int)SasCenter_GetRaw() - 5000) < 5);
+    /* 6b. sensor re-assembled far outside the learning window: alarm, then recovery */
+    memset(g_flash, 0xFF, sizeof g_flash);
+    SasCenter_Init();
+    tick(4000, 5.0f, 0.6f, 3.0f, 900, 1100);
+    for (int i = 0; i < 150; ++i) tick((uint16_t)(SAS_CENTER_RAW + 5000), 8.0f, 0.0f, 0.0f, 2000, 2000);
+    assert(SasCenter_GetLevel() == SAS_CENTER_LEVEL_ALARM && SasCenter_GetRaw() == SAS_CENTER_RAW);
+    for (int i = 0; i < 100; ++i) tick(7100, 8.0f, 0.0f, 0.0f, 2000, 2000);
+    assert(SasCenter_GetLevel() == SAS_CENTER_LEVEL_OK && SasCenter_GetRaw() == 7100);
     /* 7. full sector -> erased at boot, value preserved via fallback */
     for (unsigned i = 0; i < 0x20000 / 4; i += 2) { g_flash[i] = 0x5A5A0000u | 7100u; g_flash[i + 1] = ~g_flash[i]; }
     uint32_t e0 = g_erases; SasCenter_Init(); assert(g_erases == e0 + 1 && SasCenter_GetRaw() == 7100);
-    puts("SAS center: stand guard, wrap, replay capture, save/reload, slip alarm, full-sector erase PASS");
+    puts("SAS center: stand guard, wrap, replay capture, save/reload, slip alarm, out-of-window alarm, full-sector erase PASS");
     return 0;
 }

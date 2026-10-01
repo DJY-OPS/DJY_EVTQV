@@ -30,6 +30,8 @@ static volatile bool     s_tracking;            /* false = CAPTURE, true = TRACK
 static uint16_t s_buf[SAS_LEARN_CAPTURE_N];     /* CAPTURE 버퍼 (영점 기준 오프셋 + SAS_HALF) */
 static uint16_t s_buf_n;
 static uint16_t s_track_reject;
+static uint16_t s_window_reject;                /* 직진인데 학습 한계 밖인 샘플 수 */
+static volatile bool s_out_of_window;           /* 센서가 한계 밖으로 돌아감 → 경보 */
 static uint32_t s_last_rx_us;
 static bool     s_grounded;                    /* 이번 전원에서 차가 실제로 땅에서 돈 적이 있나 */
 
@@ -62,6 +64,7 @@ uint16_t SasCenter_GetRaw(void) {
 uint8_t SasCenter_GetSource(void) { return s_source; }
 
 uint8_t SasCenter_GetLevel(void) {
+    if (s_out_of_window) return SAS_CENTER_LEVEL_ALARM;
     float dev = fabsf(s_center - (float)SAS_CENTER_RAW);
     if (dev > (float)SAS_CENTER_ALARM_RAW) return SAS_CENTER_LEVEL_ALARM;
     if (dev > (float)SAS_CENTER_WARN_RAW)  return SAS_CENTER_LEVEL_WARN;
@@ -120,6 +123,8 @@ void SasCenter_Init(void) {
     s_tracking = false;
     s_buf_n = 0;
     s_track_reject = 0;
+    s_window_reject = 0;
+    s_out_of_window = false;
 }
 
 static uint16_t median_u16(uint16_t *a, uint16_t n) {
@@ -162,12 +167,20 @@ void SasCenter_Update(uint16_t raw, float v, float yaw_rate, float lat_acc,
     if (!s_tracking) {
         /* CAPTURE: 공칭 영점에서 너무 먼 값(센서 고장)만 거르고 모은다 */
         float candidate = s_center + (float)off;
-        if (fabsf(candidate - (float)SAS_CENTER_RAW) > (float)SAS_LEARN_WINDOW_RAW) return;
+        if (fabsf(candidate - (float)SAS_CENTER_RAW) > (float)SAS_LEARN_WINDOW_RAW) {
+            /* 직진인데 계속 한계 밖 = 센서를 다시 조립하며 크게 돌아감. 영점을
+             * 믿을 수 없으므로 경보(→ TV 금지). 한계 안의 직진이 잡히면 풀린다. */
+            if (s_window_reject < SAS_LEARN_CAPTURE_N && ++s_window_reject >= SAS_LEARN_CAPTURE_N)
+                s_out_of_window = true;
+            return;
+        }
         s_buf[s_buf_n++] = (uint16_t)(off + SAS_HALF);
         if (s_buf_n >= SAS_LEARN_CAPTURE_N) {
             int med = (int)median_u16(s_buf, s_buf_n) - SAS_HALF;
             s_center   = clamp_center(s_center + (float)med);
             s_source   = SAS_CENTER_SRC_STRAIGHT;
+            s_out_of_window = false;
+            s_window_reject = 0;
             s_tracking = true;
             s_buf_n = 0;
             s_track_reject = 0;
