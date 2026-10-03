@@ -161,6 +161,20 @@ void TV_Update(TV_t *tv) {
                                       IMU_GetLateralAcc());   /* 부호는 imu_sensor.c에서 이미 적용 */
         dP_raw *= tscale;
 
+        /* 피드포워드: 조향각 비례 기본 분배(ED와 같은 기구학 비율 × TV_FF_GAIN).
+         * 급선회에서 하중이 빠진 안쪽 바퀴가 헛돌지 않게 미리 바깥쪽으로 나눈다.
+         * 고속 페이드도 ED와 같게 적용하고, 횡G 불일치(미끄러짐) 때는 같이 줄인다. */
+        {
+            float k = (TRACK_WIDTH / (2.0f * WHEELBASE)) * tanf(delta);
+            k = CLAMP(k, -ED_K_MAX, ED_K_MAX);
+            float fade = 1.0f;
+            if (v > ED_FADE_START_MPS) {
+                float t = (v - ED_FADE_START_MPS) / (ED_FADE_END_MPS - ED_FADE_START_MPS);
+                fade = CLAMP(1.0f - t * (1.0f - ED_FADE_MIN_GAIN), ED_FADE_MIN_GAIN, 1.0f);
+            }
+            dP_raw += TV_FF_GAIN * P_demand * k * fade * tscale;
+        }
+
         /* 저속 과대개입 방지 (ΔF 한계) */
         float lim = delta_power_limit(v, P_demand);
         dP_raw = CLAMP(dP_raw, -lim, lim);
